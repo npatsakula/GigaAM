@@ -1,4 +1,4 @@
-"""Quantize a GigaAM encoder's Linear layers to FP8.
+"""Quantize a GigaAM encoder's (and RNNT head's) Linear layers to FP8.
 
 ``quantize_encoder`` walks ``model.encoder`` and replaces the target ``nn.Linear``
 modules with ``FP8Linear``. The decision of which Linears to swap is made by the
@@ -9,20 +9,28 @@ Why each excluded class is excluded (see gigaam/encoder.py for the architecture)
 
 - ``pre_encode.conv.*`` : the strided subsampling input convolutions run on raw
   log-mel features; a quantization error at the input boundary propagates through
-  every downstream layer. They are convolutions, not the target GEMMs anyway.
+  every downstream layer. They are convolutions, not the target GEMMs, so they are
+  also skipped by the ``isinstance(mod, nn.Linear)`` filter in the walk.
 - ``layers.*.conv.*`` : the Conformer convolution module (pointwise -> GLU ->
-  depthwise -> BN -> SiLU -> pointwise). The GLU gate is precision-sensitive and
-  the batch-norm running stats need range. Kept fp16.
-- attention ``linear_pos`` (only present for rel_pos, not rotary): tiny, position
-  projection; kept fp16 for parity with the rotary cos/sin path.
+  depthwise -> BN/LN -> SiLU -> pointwise). The GLU gate is precision-sensitive and
+  the norm running stats need range. Kept in the module's native dtype.
+- attention ``linear_pos`` (only present for rel_pos, not rotary): tiny position
+  projection; kept unquantized for parity with the rotary cos/sin path.
 - Everything that is not an ``nn.Linear`` (LayerNorms, BatchNorms, embeddings,
   softmax, rotary buffers, pos_bias_u/v) is left untouched by construction.
 
 The CTC head (``model.head``) is intentionally NOT quantized: it is a single 1x1
 Conv1d of ~60k params (~0.03% of the model) feeding a log_softmax. Not worth the
 risk for the negligible memory/compute savings.
+
+``compute_dtype`` defaults to ``None`` (auto-detect the module's native parameter
+dtype in :meth:`FP8Linear.from_linear`) so the quantized layers keep the dtype of
+the surrounding un-quantized ops — fp32 during QAT (fp32 encoder), fp16 in the
+halved eval/deploy path. Forcing a fixed fp16 while the encoder is fp32 makes the
+first un-quantized ``matmul``/``conv`` raise on a fp16/fp32 mix.
 """
 
+import warnings
 from typing import Dict, Optional
 
 import torch
@@ -37,24 +45,27 @@ def should_quantize(name: str) -> bool:
     ``name`` is the path relative to the *encoder* root, e.g.
     ``layers.0.feed_forward1.linear1``. For head modules use
     :func:`should_quantize_head`.
+
+    Selection anchors on the *parent* module suffix and the exact leaf name rather
+    than loose substring tests, so ``self_attn.linear_pos`` (rel_pos only) is not
+    accidentally swept in by a ``self_attn.linear_`` substring — the previous
+    implementation returned True for ``linear_pos`` because that check fired before
+    the dedicated exclusion could run.
     """
     # Subsampling output projection: a real GEMM, safe to quantize.
     if name == "pre_encode.out":
         return True
-    # Subsampling input convs: excluded (handled by conv branch below), but the
-    # convs are Conv2d, not Linear, so they never reach here anyway.
-    if name.startswith("pre_encode."):
-        return False
-    # Conformer convolution module: excluded (GLU gate + BatchNorm precision).
+    # Conformer convolution module: excluded (GLU gate + norm precision).
     if ".conv." in name:
         return False
-    # Feed-forward and attention projection Linears: the prime targets.
-    if ".feed_forward1." in name or ".feed_forward2." in name:
-        return True
-    if ".self_attn.linear_" in name:  # linear_q/k/v/out
-        return True
-    if name.endswith(".self_attn.linear_pos"):  # rel_pos variant only
-        return False
+
+    parent, _, leaf = name.rpartition(".")
+    # Feed-forward projections: the prime targets.
+    if parent.endswith(("feed_forward1", "feed_forward2")):
+        return leaf in ("linear1", "linear2")
+    # Attention q/k/v/out projections -> FP8; linear_pos (rel_pos) stays unquantized.
+    if parent.endswith("self_attn"):
+        return leaf in ("linear_q", "linear_k", "linear_v", "linear_out")
     # Any other Linear we did not explicitly classify: leave it alone.
     return False
 
@@ -66,17 +77,10 @@ def should_quantize_head(name: str) -> bool:
 
     RNNT joint: the ``enc`` and ``pred`` projection Linears are GEMMs and safe to
     quantize. The ``joint_net`` final vocab projection and the LSTM decoder /
-    embedding stay fp16 (output logits / recurrent / gather — see analysis).
-    The CTC head is a single 1x1 Conv1d (~0.03% of params) and is left fp16.
+    embedding stay unquantized (output logits / recurrent / gather). The CTC head is
+    a single 1x1 Conv1d and has no Linears.
     """
-    # RNNT joint input projections -> FP8.
-    if name in ("joint.enc", "joint.pred"):
-        return True
-    # RNNT joint final vocab projection -> fp16 (output logits precision).
-    if name.startswith("joint.joint_net"):
-        return False
-    # Everything else in the head (decoder LSTM, embedding, CTC conv) -> fp16.
-    return False
+    return name in ("joint.enc", "joint.pred")
 
 
 def _set_submodule(root: nn.Module, dotted: str, module: nn.Module) -> None:
@@ -90,25 +94,27 @@ def _set_submodule(root: nn.Module, dotted: str, module: nn.Module) -> None:
 
 def quantize_encoder(
     model: nn.Module,
-    compute_dtype: torch.dtype = torch.float16,
-) -> Dict[str, nn.Module]:
+    compute_dtype: Optional[torch.dtype] = None,
+) -> Dict[str, FP8Linear]:
     """Replace eligible Linears in ``model.encoder`` with ``FP8Linear`` in place.
 
     Parameters
     ----------
     model : nn.Module
         A GigaAM model (must expose ``.encoder``).
-    compute_dtype : torch.dtype
-        Dtype the simulated matmul runs in.
+    compute_dtype : torch.dtype, optional
+        Dtype the simulated matmul runs in. ``None`` (default) auto-detects each
+        Linear's native dtype; pass an explicit dtype to override.
 
     Returns
     -------
     dict
-        Mapping of quantized dotted-path -> the new ``FP8Linear`` module, for
-        introspection / scale-baking by the calibration step.
+        Mapping of *model-root* dotted-path (``encoder.<...>``) -> the new
+        ``FP8Linear`` module, matching the keys used by
+        :func:`bake_activation_scales` / :func:`collect_fp8_linears`.
     """
     encoder = model.encoder
-    replaced: Dict[str, nn.Module] = {}
+    replaced: Dict[str, FP8Linear] = {}
     # Snapshot names first since we mutate the tree while iterating.
     linear_items = [
         (name, mod)
@@ -120,27 +126,23 @@ def quantize_encoder(
             continue
         fp8 = FP8Linear.from_linear(linear, compute_dtype=compute_dtype)
         _set_submodule(encoder, name, fp8)
-        replaced[name] = fp8
+        replaced[f"encoder.{name}"] = fp8
     return replaced
 
 
 def quantize_head(
     model: nn.Module,
     compute_dtype: Optional[torch.dtype] = None,
-) -> Dict[str, nn.Module]:
+) -> Dict[str, FP8Linear]:
     """Replace eligible Linears in ``model.head`` with ``FP8Linear`` in place.
 
     Only the RNNT joint's ``enc``/``pred`` projections are quantized; the CTC head
     (Conv1d) has no Linears and is left untouched. See :func:`should_quantize_head`.
-
-    ``compute_dtype`` defaults to the head's native parameter dtype (fp32 for the
-    RNNT head, which ``load_model`` leaves un-halved), so the FP8 matmul matches
-    the surrounding fp32 ops in the joint/decoder.
+    ``compute_dtype`` defaults to auto-detecting the head's native dtype (fp32 for
+    the RNNT head, which ``load_model`` leaves un-halved).
     """
     head = model.head
-    if compute_dtype is None:
-        compute_dtype = next(head.parameters()).dtype
-    replaced: Dict[str, nn.Module] = {}
+    replaced: Dict[str, FP8Linear] = {}
     linear_items = [
         (name, mod) for name, mod in head.named_modules() if isinstance(mod, nn.Linear)
     ]
@@ -155,40 +157,66 @@ def quantize_head(
 
 def quantize_model(
     model: nn.Module,
-    compute_dtype: torch.dtype = torch.float16,
-) -> Dict[str, nn.Module]:
-    """Quantize both the encoder and (if applicable) the RNNT head.
+    compute_dtype: Optional[torch.dtype] = None,
+) -> Dict[str, FP8Linear]:
+    """Quantize both the encoder and (if applicable) the RNNT head in place.
 
-    The encoder uses ``compute_dtype`` (fp16, matching the fp16 encoder). The head
-    auto-detects its own native dtype (fp32) so the RNNT joint stays internally
-    consistent. Returns a mapping of dotted-path -> FP8Linear.
-
-    Note: the key convention is intentionally *inconsistent* between the two
-    sub-maps — encoder keys are bare (``layers.0...``) while head keys carry a
-    ``head.`` prefix (``head.joint.enc``). This mirrors how
-    :func:`bake_activation_scales` / :func:`collect_fp8_linears` key by
-    model-root ``named_modules()`` paths (encoder.* / head.*) only for the head.
-    The return value is for introspection only; never key amax/scale lookups off
-    it — re-walk ``model.named_modules()`` instead.
+    Both sub-maps are keyed by model-root ``named_modules()`` paths (``encoder.*`` /
+    ``head.*``), so the returned dict can be used directly for introspection and its
+    keys match :func:`collect_fp8_linears` and the calibration amax dict.
     """
     replaced = quantize_encoder(model, compute_dtype=compute_dtype)
     if hasattr(model, "head"):
-        replaced.update(quantize_head(model, compute_dtype=None))
+        replaced.update(quantize_head(model, compute_dtype=compute_dtype))
     return replaced
 
 
 def bake_activation_scales(model: nn.Module, amax_dict: Dict[str, float]) -> int:
     """Apply per-tensor activation ``amax`` values to the model's FP8Linears.
 
-    Covers both encoder and head FP8Linears. Keys in ``amax_dict`` are model-root
-    paths: encoder keys are prefixed ``encoder.`` and head keys ``head.``.
+    Keys in ``amax_dict`` are model-root paths: encoder keys are prefixed
+    ``encoder.`` and head keys ``head.`` (as produced by the calibrator, which walks
+    the same ``named_modules()`` tree). Returns the number of scales baked.
+
+    Fails loudly on a total key-namespace mismatch (e.g. a stale calibration file
+    with bare ``layers.*`` keys) instead of silently baking nothing and leaving the
+    run on dynamic scaling; warns on partial mismatches so a wrong/outdated file is
+    visible rather than a silent train/deploy scale discrepancy.
     """
-    n = 0
-    for name, mod in model.named_modules():
-        if isinstance(mod, FP8Linear) and name in amax_dict:
-            mod.bake_activation_scale(amax_dict[name])
-            n += 1
-    return n
+    fp8 = {
+        name: mod
+        for name, mod in model.named_modules()
+        if isinstance(mod, FP8Linear)
+    }
+    matched = [name for name in fp8 if name in amax_dict]
+    for name in matched:
+        fp8[name].bake_activation_scale(amax_dict[name])
+
+    if amax_dict and not matched:
+        example_model = sorted(fp8)[:2]
+        example_keys = sorted(amax_dict)[:2]
+        raise ValueError(
+            f"bake_activation_scales matched 0 of {len(fp8)} FP8Linear modules "
+            f"against {len(amax_dict)} calibration keys — key-namespace mismatch. "
+            f"Model paths look like {example_model}; calibration keys look like "
+            f"{example_keys}. Expected model-root paths (encoder.* / head.*)."
+        )
+
+    stale = sorted(set(amax_dict) - set(fp8))
+    if stale:
+        warnings.warn(
+            f"bake_activation_scales: {len(stale)} calibration key(s) matched no "
+            f"FP8Linear (e.g. {stale[:2]}); they were ignored.",
+            stacklevel=2,
+        )
+    missing = sorted(set(fp8) - set(amax_dict))
+    if missing:
+        warnings.warn(
+            f"bake_activation_scales: {len(missing)} FP8Linear(s) received no static "
+            f"scale and will use dynamic scaling (e.g. {missing[:2]}).",
+            stacklevel=2,
+        )
+    return len(matched)
 
 
 def collect_fp8_linears(model: nn.Module) -> Dict[str, FP8Linear]:

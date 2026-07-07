@@ -1,5 +1,6 @@
 import copy
 import math
+import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import editdistance
@@ -110,7 +111,12 @@ class GigaAMFineTuner(pl.LightningModule):
             if self.mode == "ctc":
                 # CTC head is not quantized -> shared between teacher and student.
                 self.teacher_head = None
-                quantize_encoder(self, compute_dtype=torch.float16)
+                # compute_dtype auto-detects each Linear's native dtype (fp32 here,
+                # since train.py loads fp16_encoder=False). Forcing fp16 would make
+                # the quantized layers emit fp16 into the otherwise-fp32 encoder,
+                # crashing on the first un-quantized conv/matmul for conv2d/rel_pos
+                # models; auto-detect keeps the whole encoder in one dtype.
+                quantize_encoder(self)
             elif self.mode == "rnnt":
                 # RNNT joint enc/pred are quantized in the student -> the teacher
                 # needs its own full-precision head (decoder LSTM + joint). The
@@ -119,9 +125,9 @@ class GigaAMFineTuner(pl.LightningModule):
                 for p in teacher_head.parameters():
                     p.requires_grad = False
                 self.teacher_head = teacher_head
-                # quantize_model handles both the encoder (fp16 compute_dtype)
-                # and the head (auto-detected native fp32) in place.
-                quantize_model(self, compute_dtype=torch.float16)
+                # quantize_model quantizes the encoder and the RNNT joint enc/pred,
+                # each following its own module's native dtype (fp32 here).
+                quantize_model(self)
             else:  # pragma: no cover - guarded above
                 raise ValueError(f"FP8 QAT + KD does not support mode={self.mode!r}")
 
@@ -143,6 +149,13 @@ class GigaAMFineTuner(pl.LightningModule):
         else:
             self.teacher_encoder = None
             self.teacher_head = None
+            if calibration_scales is not None:
+                warnings.warn(
+                    "calibration_scales was provided but fp8=False; FP8 QAT and KD "
+                    "are disabled, so the calibration file is ignored. Pass --fp8 to "
+                    "enable quantization-aware training.",
+                    stacklevel=2,
+                )
 
         self._val_errors = self._val_words = 0
 
@@ -161,6 +174,25 @@ class GigaAMFineTuner(pl.LightningModule):
 
     def on_train_epoch_start(self):
         self.train()
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        # The KD teachers are frozen copies of the pretrained encoder/head,
+        # deterministically reconstructed in __init__, so serialising them into
+        # every checkpoint just doubles its size. Strip them on save; on_load
+        # re-injects the freshly-built copies so a strict state_dict load still
+        # sees no missing keys.
+        sd = checkpoint.get("state_dict")
+        if sd is not None:
+            for k in list(sd):
+                if k.startswith(("teacher_encoder.", "teacher_head.")):
+                    del sd[k]
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        sd = checkpoint.get("state_dict")
+        if sd is not None:
+            for k, v in self.state_dict().items():
+                if k.startswith(("teacher_encoder.", "teacher_head.")) and k not in sd:
+                    sd[k] = v
 
     def _ctc_loss(
         self,
@@ -198,21 +230,29 @@ class GigaAMFineTuner(pl.LightningModule):
     ) -> Tensor:
         """Per-frame CTC knowledge-distillation loss: ``KL(teacher || student)``.
 
-        The frozen fp16 teacher encodes the same mel ``features`` and produces CTC
+        The frozen teacher encodes the same mel ``features`` and produces CTC
         log-probs through the (shared) head. We minimise the KL divergence of the
         student's per-frame distribution toward the teacher's soft distribution.
         Soft per-frame distributions carry "dark knowledge" about confusable phones,
         recovering most of the WER gap that PTQ FP8 costs.
+
+        The KL is summed over valid frames and averaged over the batch, matching the
+        scale of ``_ctc_loss`` (``nn.CTCLoss(reduction="none")`` gives a per-sequence
+        *summed* NLL, then ``.mean()`` over the batch). Normalising by the number of
+        frames instead — as the first version did — makes the KD term ~2 orders of
+        magnitude smaller than the CE term, so ``kd_alpha`` has almost no effect.
 
         ``student_log_probs`` already includes a log_softmax (from CTCHead); the
         teacher path is recomputed here under no_grad.
         """
         assert self.teacher_encoder is not None, "KD requires a teacher encoder"
         dev = student_log_probs.device
-        t_dev = next(self.teacher_encoder.parameters()).device
+        teacher = self.teacher_encoder
+        t_dev = next(teacher.parameters()).device
+        t_dtype = next(teacher.parameters()).dtype
         with torch.no_grad():
-            t_features = features.to(t_dev).half()
-            t_enc, t_enc_len = self.teacher_encoder(t_features, feat_lens.to(t_dev))
+            t_features = features.to(t_dev).to(t_dtype)
+            t_enc, _ = teacher(t_features, feat_lens.to(t_dev))
             teacher_log_probs = self.head(t_enc.float().to(dev))
         # Teacher and student share an identical architecture and the same input,
         # so their logit shapes must match frame-for-frame. If they ever don't the
@@ -221,18 +261,17 @@ class GigaAMFineTuner(pl.LightningModule):
             f"teacher/student logit shape mismatch: "
             f"{tuple(teacher_log_probs.shape)} vs {tuple(student_log_probs.shape)}"
         )
-        # KL(p_teacher || p_student) = sum p_t * (log p_t - log p_s), averaged over
-        # valid frames. Mask out padded frames via enc_lens.
-        T = student_log_probs.size(1)
-        with torch.no_grad():
-            p_t = teacher_log_probs.exp()
-        kl = p_t * (teacher_log_probs - student_log_probs)  # [B, T, V]
-        kl = kl.sum(dim=-1)  # [B, T]
+        # KL(teacher || student) per frame via F.kl_div(log_target=True): computes
+        # exp(log_q) * (log_q - log_p) fused, without materialising exp() of the full
+        # [B, T, V] teacher tensor. Gradient flows through the student only.
+        B, T = student_log_probs.shape[0], student_log_probs.size(1)
+        kl = torch.nn.functional.kl_div(
+            student_log_probs, teacher_log_probs, reduction="none", log_target=True
+        ).sum(dim=-1)  # [B, T]
         frame_mask = (
             torch.arange(T, device=dev)[None, :] < enc_lens.to(dev)[:, None]
-        ).float()
-        denom = frame_mask.sum().clamp(min=1.0)
-        return (kl * frame_mask).sum() / denom
+        ).to(kl.dtype)
+        return (kl * frame_mask).sum() / max(B, 1)
 
     def _encode(
         self, wavs: Tensor, wav_lens: Tensor, return_features: bool = False
@@ -291,6 +330,11 @@ class GigaAMFineTuner(pl.LightningModule):
         frames (``t < enc_lens``) and valid prediction positions (``u <= tok_lens``,
         i.e. columns ``0..U`` including the final blank). Temperature is fixed at
         1, matching the CTC KD.
+
+        The masked KL is summed over valid lattice cells and averaged over the
+        (sub-)batch so it shares the scale of ``_rnnt_loss`` (``reduction="mean"``
+        over the batch of per-sequence transducer NLLs). Dividing by the number of
+        cells instead made the KD term negligible next to the CE term.
         """
         dev = student_logits.device
         teacher_logits = teacher_logits.to(dev)
@@ -309,7 +353,8 @@ class GigaAMFineTuner(pl.LightningModule):
         # final blank emission (max_u1 = tok_lens.max() + 1).
         u_mask = torch.arange(U1, device=dev)[None, :] <= tok_lens.to(dev)[:, None]
         cell_mask = (t_mask.unsqueeze(2) & u_mask.unsqueeze(1)).to(kl.dtype)
-        return (kl * cell_mask).sum() / cell_mask.sum().clamp(min=1.0)
+        batch = student_logits.size(0)
+        return (kl * cell_mask).sum() / max(batch, 1)
 
     def _rnnt_forward(
         self,
@@ -350,9 +395,10 @@ class GigaAMFineTuner(pl.LightningModule):
         t_encoded: "Optional[Tensor]" = None
         if use_kd:
             assert self.teacher_head is not None, "RNNT KD requires a teacher head"
-            t_dev = next(self.teacher_encoder.parameters()).device
+            t_param = next(self.teacher_encoder.parameters())
+            t_dev = t_param.device
             with torch.no_grad():
-                t_features = kd_ctx["features"].to(t_dev).half()
+                t_features = kd_ctx["features"].to(t_dev).to(t_param.dtype)
                 t_feat_lens = kd_ctx["feat_lens"].to(t_dev)
                 t_encoded, _ = self.teacher_encoder(t_features, t_feat_lens)
 
