@@ -167,7 +167,13 @@ def quantize_model(
     """
     replaced = quantize_encoder(model, compute_dtype=compute_dtype)
     if hasattr(model, "head"):
-        replaced.update(quantize_head(model, compute_dtype=compute_dtype))
+        # The head is never halved by load_model (it halves the encoder only), so
+        # the RNNT joint's enc/pred GEMMs must follow the head's own native dtype
+        # (fp32) — matching the un-quantized joint_net / decoder — regardless of the
+        # encoder's compute_dtype. Passing the encoder's fp16 here would make the
+        # joint enc/pred emit fp16 into the fp32 joint_net and crash. Always
+        # auto-detect (None) for the head.
+        replaced.update(quantize_head(model, compute_dtype=None))
     return replaced
 
 
