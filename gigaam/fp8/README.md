@@ -19,9 +19,15 @@ FP8 and issues MFMA.
 
 The decision is encoded in `quantize.should_quantize` and is auditable.
 
-## Three stages
+## Two stages
 
-### 1. Calibration + PTQ WER (cheapest baseline)
+FP8 E4M3 PTQ is near-lossless on GigaAM v3 (~97–98% transcript agreement with the
+fp16 model on held-out audio), so the pipeline is just **calibrate → export**.
+QAT + logit knowledge distillation was evaluated and did **not** shrink the
+(already tiny) FP8-vs-fp16 gap — training perturbs the near-optimal PTQ weights —
+so it is not part of the flow.
+
+### 1. Calibration + PTQ WER
 
 ```bash
 uv run python -m gigaam.fp8.calibrate \
@@ -31,27 +37,11 @@ uv run python -m gigaam.fp8.calibrate \
     --export_dir fp8_out
 ```
 
-Loads the fp16 teacher, quantizes the student, collects per-tensor activation
-`amax` over `n_batches`, bakes the scales, and reports teacher vs. FP8-PTQ WER.
-Writes `activation_scales.json` + the exported artifact.
+Loads the fp16 model, quantizes it, collects per-tensor activation `amax` over
+`n_batches`, bakes the scales, and reports fp16 vs. FP8-PTQ WER. Writes
+`activation_scales.json` + the exported artifact.
 
-### 2. QAT + logit knowledge distillation (recovers the WER gap)
-
-```bash
-cd train_utils
-uv run python train.py \
-    --model_name v3_e2e_ctc \
-    --train_manifest train.tsv --val_manifest val.tsv \
-    --max_steps 300 --val_check_steps 100 \
-    --batch_size 8 --lr 1e-5 \
-    --fp8 --kd_alpha 0.5 \
-    --calibration_scales ../fp8_out/activation_scales.json
-```
-
-The student encoder is FP8 (STE); a frozen fp16 teacher supplies per-frame CTC
-logits for a KL distillation term. Loss = `α·CE(student, GT) + (1−α)·KL(teacher ‖ student)`.
-
-### 3. Export
+### 2. Export
 
 ```python
 import gigaam

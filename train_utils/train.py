@@ -67,31 +67,10 @@ def parse_args() -> argparse.Namespace:
         "(ai-sage/GigaAM-v3) instead of the default CDN. Use when the CDN is unreachable.",
     )
     p.add_argument(
-        "--fp8",
-        action="store_true",
-        help="FP8 QAT: quantize GEMM Linears to E4M3 (simulated) and "
-        "train with logit KD against a frozen fp16 teacher. CTC does "
-        "per-frame KD; RNNT does grid-level KD over the (T,U+1) lattice.",
-    )
-    p.add_argument(
-        "--kd_alpha",
-        type=float,
-        default=0.5,
-        help="Weight on the GT CE/RNNT loss; (1-alpha) on teacher KD (FP8 mode).",
-    )
-    p.add_argument(
-        "--calibration_scales",
-        type=str,
-        default=None,
-        help="Path to activation_scales.json from gigaam.fp8.calibrate (FP8 mode).",
-    )
-    p.add_argument(
         "--compile",
         action="store_true",
-        help="torch.compile the encoder (and the KD teacher, in FP8 mode) with "
-        "dynamic shapes. Worthwhile on fp8-capable GPUs (Hopper/Ada/MI300X); on "
-        "Ampere the E4M3 cast can't be codegen'd by Triton so FP8Linear falls back "
-        "to eager and the speedup is negligible (~1x) for a large compile cost.",
+        help="torch.compile the encoder with dynamic shapes (Conformer fusion); "
+        "helps fp16/bf16 fine-tunes on any GPU.",
     )
 
     args = p.parse_args()
@@ -189,9 +168,6 @@ def main():
         freq_width=args.freq_width,
         time_masks=args.time_masks,
         time_width=args.time_width,
-        fp8=args.fp8,
-        kd_alpha=args.kd_alpha,
-        calibration_scales=args.calibration_scales,
         compile=args.compile,
         cli_args=vars(args),
     )

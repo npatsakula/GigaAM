@@ -1,7 +1,5 @@
-import copy
 import math
-import warnings
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import editdistance
 import pytorch_lightning as pl
@@ -32,9 +30,6 @@ class GigaAMFineTuner(pl.LightningModule):
         freq_width: int = 27,
         time_masks: int = 2,
         time_width: int = 20,
-        fp8: bool = False,
-        kd_alpha: float = 0.5,
-        calibration_scales: Optional[str] = None,
         compile: bool = False,
         cli_args: Optional[Dict[str, Any]] = None,
     ):
@@ -60,7 +55,6 @@ class GigaAMFineTuner(pl.LightningModule):
                 [TimeMasking(time_width) for _ in range(time_masks)]
             )
 
-        # Head / loss selection (must run before the FP8 block, which checks mode).
         self._rnnt_vocab_size = 0
         if isinstance(self.head, CTCHead):
             self.mode = "ctc"
@@ -84,99 +78,14 @@ class GigaAMFineTuner(pl.LightningModule):
             for p in self.encoder.parameters():
                 p.requires_grad = False
 
-        # --- FP8 quantization-aware training + logit knowledge distillation ---
-        # The student has its GEMM Linears swapped for FP8Linear (E4M3 simulated,
-        # STE). A frozen copy of the *original* (pre-quantization) model acts as
-        # the teacher for logit KD:
-        #   - CTC:  teacher = fp16 encoder copy. The CTC head (1x1 Conv1d) is NOT
-        #           quantized, so teacher and student share self.head.
-        #   - RNNT: teacher = fp16 encoder copy + fp32 head copy. The RNNT joint
-        #           enc/pred Linears ARE quantized in the student and the decoder
-        #           LSTM drifts during training, so the teacher needs its own
-        #           full-precision joint + decoder.
-        # Both teachers are registered as submodules so Lightning moves them to
-        # the accelerator device; all their params are frozen so they are never
-        # optimised. The teacher copies are taken BEFORE quantizing the student.
-        self._fp8 = fp8
-        self._kd_alpha = kd_alpha
-        if fp8:
-            from gigaam.fp8 import bake_activation_scales
-            from gigaam.fp8.quantize import quantize_encoder, quantize_model
-
-            # Frozen fp16 teacher encoder (used by both CTC and RNNT KD).
-            teacher = copy.deepcopy(self.encoder).half()
-            for p in teacher.parameters():
-                p.requires_grad = False
-            self.teacher_encoder = teacher
-
-            if self.mode == "ctc":
-                # CTC head is not quantized -> shared between teacher and student.
-                self.teacher_head = None
-                # compute_dtype auto-detects each Linear's native dtype (fp32 here,
-                # since train.py loads fp16_encoder=False). Forcing fp16 would make
-                # the quantized layers emit fp16 into the otherwise-fp32 encoder,
-                # crashing on the first un-quantized conv/matmul for conv2d/rel_pos
-                # models; auto-detect keeps the whole encoder in one dtype.
-                quantize_encoder(self)
-            elif self.mode == "rnnt":
-                # RNNT joint enc/pred are quantized in the student -> the teacher
-                # needs its own full-precision head (decoder LSTM + joint). The
-                # head stays fp32 (its native dtype under load_model_from_hf).
-                teacher_head = copy.deepcopy(self.head)
-                for p in teacher_head.parameters():
-                    p.requires_grad = False
-                self.teacher_head = teacher_head
-                # quantize_model quantizes the encoder and the RNNT joint enc/pred,
-                # each following its own module's native dtype (fp32 here).
-                quantize_model(self)
-            else:  # pragma: no cover - guarded above
-                raise ValueError(f"FP8 QAT + KD does not support mode={self.mode!r}")
-
-            # Bake activation scales from calibration if provided.
-            if calibration_scales is not None:
-                import json
-
-                with open(calibration_scales) as f:
-                    amax = json.load(f)
-                n = bake_activation_scales(self, amax)
-                print(f"  FP8: baked {n} activation scales from {calibration_scales}")
-            head_note = (
-                " + teacher head" if self.teacher_head is not None else ""
-            )
-            print(
-                f"  FP8 QAT enabled: student quantized, teacher"
-                f" encoder{head_note}, kd_alpha={kd_alpha}"
-            )
-        else:
-            self.teacher_encoder = None
-            self.teacher_head = None
-            if calibration_scales is not None:
-                warnings.warn(
-                    "calibration_scales was provided but fp8=False; FP8 QAT and KD "
-                    "are disabled, so the calibration file is ignored. Pass --fp8 to "
-                    "enable quantization-aware training.",
-                    stacklevel=2,
-                )
-
         if compile:
-            # Compile the encoder(s) in place. nn.Module.compile() keeps the module
+            # Compile the encoder in place. nn.Module.compile() keeps the module
             # identity and state_dict keys intact (unlike torch.compile(m), which
             # wraps in an OptimizedModule and prefixes keys with "_orig_mod."), so
             # checkpoints stay compatible with gigaam.load_model. dynamic=True avoids
-            # a recompile per audio length; suppress_errors falls back to eager for
-            # any op the backend can't codegen (e.g. the E4M3 cast on Ampere) instead
-            # of crashing a long run. Compilation itself is lazy (first forward).
-            import torch._dynamo
-
-            torch._dynamo.config.suppress_errors = True
+            # a recompile per audio length; compilation is lazy (first forward).
             self.encoder.compile(dynamic=True)
-            if self.teacher_encoder is not None:
-                self.teacher_encoder.compile(dynamic=True)
-            print(
-                "  torch.compile enabled on encoder"
-                + (" + teacher encoder" if self.teacher_encoder is not None else "")
-                + " (dynamic shapes; lazy-compiles on first step)"
-            )
+            print("  torch.compile enabled on encoder (dynamic shapes)")
 
         self._val_errors = self._val_words = 0
 
@@ -186,34 +95,10 @@ class GigaAMFineTuner(pl.LightningModule):
         self.preprocessor.eval()
         if self._freeze_encoder:
             self.encoder.eval()
-        # The KD teachers are always frozen (eval), even when the student trains.
-        if self.teacher_encoder is not None:
-            self.teacher_encoder.eval()
-        if self.teacher_head is not None:
-            self.teacher_head.eval()
         return self
 
     def on_train_epoch_start(self):
         self.train()
-
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        # The KD teachers are frozen copies of the pretrained encoder/head,
-        # deterministically reconstructed in __init__, so serialising them into
-        # every checkpoint just doubles its size. Strip them on save; on_load
-        # re-injects the freshly-built copies so a strict state_dict load still
-        # sees no missing keys.
-        sd = checkpoint.get("state_dict")
-        if sd is not None:
-            for k in list(sd):
-                if k.startswith(("teacher_encoder.", "teacher_head.")):
-                    del sd[k]
-
-    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        sd = checkpoint.get("state_dict")
-        if sd is not None:
-            for k, v in self.state_dict().items():
-                if k.startswith(("teacher_encoder.", "teacher_head.")) and k not in sd:
-                    sd[k] = v
 
     def _ctc_loss(
         self,
@@ -242,61 +127,7 @@ class GigaAMFineTuner(pl.LightningModule):
             fused_log_softmax=True,
         )
 
-    def _ctc_kd_loss(
-        self,
-        features: Tensor,
-        feat_lens: Tensor,
-        student_log_probs: Tensor,
-        enc_lens: Tensor,
-    ) -> Tensor:
-        """Per-frame CTC knowledge-distillation loss: ``KL(teacher || student)``.
-
-        The frozen teacher encodes the same mel ``features`` and produces CTC
-        log-probs through the (shared) head. We minimise the KL divergence of the
-        student's per-frame distribution toward the teacher's soft distribution.
-        Soft per-frame distributions carry "dark knowledge" about confusable phones,
-        recovering most of the WER gap that PTQ FP8 costs.
-
-        The KL is summed over valid frames and averaged over the batch, matching the
-        scale of ``_ctc_loss`` (``nn.CTCLoss(reduction="none")`` gives a per-sequence
-        *summed* NLL, then ``.mean()`` over the batch). Normalising by the number of
-        frames instead — as the first version did — makes the KD term ~2 orders of
-        magnitude smaller than the CE term, so ``kd_alpha`` has almost no effect.
-
-        ``student_log_probs`` already includes a log_softmax (from CTCHead); the
-        teacher path is recomputed here under no_grad.
-        """
-        assert self.teacher_encoder is not None, "KD requires a teacher encoder"
-        dev = student_log_probs.device
-        teacher = self.teacher_encoder
-        t_dev = next(teacher.parameters()).device
-        t_dtype = next(teacher.parameters()).dtype
-        with torch.no_grad():
-            t_features = features.to(t_dev).to(t_dtype)
-            t_enc, _ = teacher(t_features, feat_lens.to(t_dev))
-            teacher_log_probs = self.head(t_enc.float().to(dev))
-        # Teacher and student share an identical architecture and the same input,
-        # so their logit shapes must match frame-for-frame. If they ever don't the
-        # per-frame KL below would silently broadcast/misalign, so guard it.
-        assert teacher_log_probs.shape == student_log_probs.shape, (
-            f"teacher/student logit shape mismatch: "
-            f"{tuple(teacher_log_probs.shape)} vs {tuple(student_log_probs.shape)}"
-        )
-        # KL(teacher || student) per frame via F.kl_div(log_target=True): computes
-        # exp(log_q) * (log_q - log_p) fused, without materialising exp() of the full
-        # [B, T, V] teacher tensor. Gradient flows through the student only.
-        B, T = student_log_probs.shape[0], student_log_probs.size(1)
-        kl = torch.nn.functional.kl_div(
-            student_log_probs, teacher_log_probs, reduction="none", log_target=True
-        ).sum(dim=-1)  # [B, T]
-        frame_mask = (
-            torch.arange(T, device=dev)[None, :] < enc_lens.to(dev)[:, None]
-        ).to(kl.dtype)
-        return (kl * frame_mask).sum() / max(B, 1)
-
-    def _encode(
-        self, wavs: Tensor, wav_lens: Tensor, return_features: bool = False
-    ) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor, Tensor]]:
+    def _encode(self, wavs: Tensor, wav_lens: Tensor) -> Tuple[Tensor, Tensor]:
         amp_dev = next(self.parameters()).device.type
         with torch.amp.autocast(amp_dev, enabled=False):
             features, feat_lens = self.preprocessor(wavs.float(), wav_lens)
@@ -305,18 +136,10 @@ class GigaAMFineTuner(pl.LightningModule):
                 features = aug(features)
             for aug in self._time_aug:
                 features = aug(features)
-        encoded, enc_lens = self.encoder(features, feat_lens)
-        if return_features:
-            return encoded, enc_lens, features, feat_lens
-        return encoded, enc_lens
+        return self.encoder(features, feat_lens)
 
-    def _rnnt_joint(
-        self,
-        encoded: Tensor,
-        tokens: Tensor,
-        head: "Optional[RNNTHead]" = None,
-    ) -> Tensor:
-        head = self.head if head is None else head
+    def _rnnt_joint(self, encoded: Tensor, tokens: Tensor) -> Tensor:
+        head = self.head
         assert isinstance(head, RNNTHead)
         enc_t = encoded.float().transpose(1, 2)
         dec, jnt = head.decoder, head.joint
@@ -331,82 +154,11 @@ class GigaAMFineTuner(pl.LightningModule):
             + jnt.pred(pred_out.transpose(0, 1)).unsqueeze(1)
         )
 
-    def _rnnt_grid_kl(
-        self,
-        teacher_logits: Tensor,
-        student_logits: Tensor,
-        enc_lens: Tensor,
-        tok_lens: Tensor,
-    ) -> Tensor:
-        """RNNT action-based knowledge distillation: grid-level ``KL(teacher || student)``.
-
-        Both inputs are the raw pre-softmax joint logits over the (T, U+1)
-        transducer lattice, shape ``[b, T, U+1, V]`` (as produced by
-        :meth:`_rnnt_joint`). We minimise the KL divergence of the student's
-        per-cell posterior toward the teacher's, mirroring the per-frame CTC KD
-        but over the 2-D alignment lattice instead of a single frame axis.
-
-        ``teacher_logits`` must be detached (computed under ``no_grad``); gradients
-        flow only through ``student_logits``. Cells are masked to valid encoder
-        frames (``t < enc_lens``) and valid prediction positions (``u <= tok_lens``,
-        i.e. columns ``0..U`` including the final blank). Temperature is fixed at
-        1, matching the CTC KD.
-
-        The KL is meaned over the U+1 prediction axis per frame, summed over valid
-        frames, and averaged over the (sub-)batch — the 2-D analogue of the CTC
-        per-frame KD — so it scales with T like the per-sequence RNNT NLL
-        (``_rnnt_loss``, ``reduction="mean"``). A plain per-cell mean makes KD
-        negligible; a full T x (U+1) sum makes it ~U-times too large and diverges.
-        """
-        dev = student_logits.device
-        teacher_logits = teacher_logits.to(dev)
-        # KL(teacher || student) = sum p_t * (log p_t - log p_s), computed via
-        # F.kl_div with log_target=True so the teacher distribution stays in
-        # log-space (numerically stable, no exp of the grid).
-        log_p = torch.log_softmax(student_logits, dim=-1)  # carries grad
-        with torch.no_grad():
-            log_q = torch.log_softmax(teacher_logits, dim=-1)
-        kl = torch.nn.functional.kl_div(
-            log_p, log_q, reduction="none", log_target=True
-        ).sum(dim=-1)  # [b, T, U+1]
-        T, U1 = kl.shape[1], kl.shape[2]
-        t_mask = torch.arange(T, device=dev)[None, :] < enc_lens.to(dev)[:, None]
-        # Valid prediction positions are 0..U inclusive; the U-th column holds the
-        # final blank emission (max_u1 = tok_lens.max() + 1).
-        u_mask = torch.arange(U1, device=dev)[None, :] <= tok_lens.to(dev)[:, None]
-        cell_mask = (t_mask.unsqueeze(2) & u_mask.unsqueeze(1)).to(kl.dtype)
-        # Per-frame KD: mean KL over the valid prediction positions (U+1 axis),
-        # then summed over valid frames and averaged over the batch. This mirrors
-        # the CTC per-frame KD (sum over T frames / batch), so the RNNT KD scales
-        # with T like the per-sequence RNNT NLL. Summing over the whole T x (U+1)
-        # lattice instead scales the term (and its gradient) by ~U, which dwarfs
-        # the CE term and destabilises training.
-        u_valid = cell_mask.sum(dim=2).clamp(min=1.0)          # [b, T] valid U per frame
-        per_frame_kl = (kl * cell_mask).sum(dim=2) / u_valid   # [b, T]
-        batch = student_logits.size(0)
-        return (per_frame_kl * t_mask.to(kl.dtype)).sum() / max(batch, 1)
-
     def _rnnt_forward(
-        self,
-        encoded: Tensor,
-        enc_lens: Tensor,
-        tokens: Tensor,
-        tok_lens: Tensor,
-        kd_ctx: "Optional[Dict[str, Tensor]]" = None,
+        self, encoded: Tensor, enc_lens: Tensor, tokens: Tensor, tok_lens: Tensor
     ) -> Tensor:
-        """RNNT loss, optionally blended with grid-level KD against the teacher.
-
-        When ``kd_ctx`` (``{"features", "feat_lens"}``) is provided the frozen fp16
-        teacher encoder is run once on the shared mel features, and within the
-        existing sub-batch loop a teacher joint grid is produced and compared to
-        the student grid via :meth:`_rnnt_grid_kl`. The per-sub-batch loss becomes
-        ``alpha * CE + (1 - alpha) * KD``. The teacher grid is computed and freed
-        inside the loop (never materialised for the whole batch) to stay within
-        the same memory budget as pure CE.
-        """
         B = encoded.size(0)
         subb = self._rnnt_subbatch_size or B
-        use_kd = kd_ctx is not None and self.teacher_encoder is not None
 
         # Ensure int32-safe indexing in _ta_rnnt_loss
         max_t = int(enc_lens.max().item())
@@ -414,63 +166,24 @@ class GigaAMFineTuner(pl.LightningModule):
         vocab_size = self._rnnt_vocab_size
         while subb > 1 and subb * max_t * max_u1 * vocab_size >= (1 << 31):
             subb = max(1, subb // 2)
-        # KD materialises two grids (teacher + student) plus log_softmax buffers per
-        # sub-batch (~4x the CE footprint). Halve the bound so e2e_rnnt (V=1025)
-        # stays within a 12 GB dev GPU; charwise rnnt (V=34) is ~30x lighter.
-        if use_kd:
-            while subb > 1 and subb * max_t * max_u1 * vocab_size >= (1 << 30):
-                subb = max(1, subb // 2)
-
-        # Teacher encoder: run once on shared mel features (cheap vs. the grid).
-        t_encoded: "Optional[Tensor]" = None
-        if use_kd:
-            assert self.teacher_head is not None, "RNNT KD requires a teacher head"
-            t_param = next(self.teacher_encoder.parameters())
-            t_dev = t_param.device
-            with torch.no_grad():
-                t_features = kd_ctx["features"].to(t_dev).to(t_param.dtype)
-                t_feat_lens = kd_ctx["feat_lens"].to(t_dev)
-                t_encoded, _ = self.teacher_encoder(t_features, t_feat_lens)
 
         losses: List[torch.Tensor] = []
-        kd_terms: List[torch.Tensor] = []
         weights: List[int] = []
         for i in range(0, B, subb):
             s = slice(i, min(i + subb, B))
             enc_i, enc_lens_i = encoded[s], enc_lens[s]
             tok_i, tok_lens_i = tokens[s], tok_lens[s]
-            sub_t = int(enc_lens_i.max().item())
-            enc_i = enc_i[:, :, :sub_t].contiguous()
+            enc_i = enc_i[:, :, : int(enc_lens_i.max().item())].contiguous()
             tok_i = tok_i[:, : int(tok_lens_i.max().item())].contiguous()
             logits_i = self._rnnt_joint(enc_i, tok_i)  # [b, T, U+1, V]
             T, U1 = logits_i.shape[1:3]
             enc_lens_i = enc_lens_i.clamp(min=1, max=T)
             tok_lens_i = tok_lens_i.clamp(min=1, max=U1 - 1)
             loss_i = self._rnnt_loss(logits_i, tok_i, enc_lens_i, tok_lens_i)
-
-            if use_kd:
-                # Teacher grid for this sub-batch (trimmed to the same T, freed
-                # after the KL). Teacher output is [b, D, T]; match the trim.
-                t_enc_i = t_encoded[s][:, :, :sub_t].float()  # type: ignore[index]
-                with torch.no_grad():
-                    t_logits_i = self._rnnt_joint(t_enc_i, tok_i, head=self.teacher_head)
-                # Teacher is frozen and detached; move to student device in case
-                # of a device split (they normally match).
-                kd_i = self._rnnt_grid_kl(
-                    t_logits_i.detach(), logits_i, enc_lens_i, tok_lens_i
-                )
-                loss_i = self._kd_alpha * loss_i + (1.0 - self._kd_alpha) * kd_i
-                kd_terms.append(kd_i.detach() * enc_i.size(0))
-                del t_logits_i, t_enc_i
-
             losses.append(loss_i * (enc_i.size(0)))
             weights.append(enc_i.size(0))
             del logits_i
 
-        if kd_terms and self.training:
-            self.log(
-                "train/kd", torch.stack(kd_terms).sum() / sum(weights), prog_bar=True
-            )
         return torch.stack(losses).sum() / sum(weights)
 
     def _batch_wer(
@@ -486,31 +199,13 @@ class GigaAMFineTuner(pl.LightningModule):
 
     def training_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
         wavs, wav_lens, tokens, tok_lens = batch
-        # Both CTC and RNNT KD need the shared mel features to feed the frozen
-        # teacher encoder on the same input the student saw.
-        need_feats = self._fp8 and self.teacher_encoder is not None
-        if need_feats:
-            encoded, enc_lens, features, feat_lens = self._encode(
-                wavs, wav_lens, return_features=True
-            )
-        else:
-            encoded, enc_lens = self._encode(wavs, wav_lens)
+        encoded, enc_lens = self._encode(wavs, wav_lens)
 
         if self.mode == "ctc":
             log_probs = self.head(encoded)
             loss = self._ctc_loss(log_probs, tokens, enc_lens, tok_lens)
-            # FP8 knowledge distillation: add a KL term on per-frame CTC logits
-            # against the frozen fp16 teacher's logits. Both heads see their own
-            # encoder output so the soft distributions align frame-by-frame.
-            if need_feats:
-                kd = self._ctc_kd_loss(features, feat_lens, log_probs, enc_lens)
-                loss = self._kd_alpha * loss + (1.0 - self._kd_alpha) * kd
-                self.log("train/kd", kd, prog_bar=True)
         else:
-            kd_ctx = (
-                {"features": features, "feat_lens": feat_lens} if need_feats else None
-            )
-            loss = self._rnnt_forward(encoded, enc_lens, tokens, tok_lens, kd_ctx=kd_ctx)
+            loss = self._rnnt_forward(encoded, enc_lens, tokens, tok_lens)
         self.log("train/loss", loss, prog_bar=True)
 
         if (
