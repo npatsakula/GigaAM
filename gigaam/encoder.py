@@ -549,6 +549,16 @@ class ConformerEncoder(nn.Module):
         else:
             self.pos_enc = RelPositionalEmbedding(d_model, pos_emb_max_len)
 
+        # Build the positional-encoding buffer eagerly, in this (normal) context.
+        # Creating it lazily inside forward() makes its dtype/device and, under
+        # modern PyTorch, its *inference-ness* depend on the first call: if that
+        # call happens under torch.inference_mode() (e.g. Lightning's initial
+        # validation), ``pe`` becomes an inference tensor and every later
+        # grad-enabled forward — i.e. training — raises "Inference tensors cannot
+        # be saved for backward". A pe built here is a normal buffer that moves
+        # with .to()/.half() and never poisons autograd.
+        self.pos_enc.extend_pe(pos_emb_max_len, torch.device("cpu"))
+
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
             layer = ConformerLayer(
