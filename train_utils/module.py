@@ -331,10 +331,11 @@ class GigaAMFineTuner(pl.LightningModule):
         i.e. columns ``0..U`` including the final blank). Temperature is fixed at
         1, matching the CTC KD.
 
-        The masked KL is summed over valid lattice cells and averaged over the
-        (sub-)batch so it shares the scale of ``_rnnt_loss`` (``reduction="mean"``
-        over the batch of per-sequence transducer NLLs). Dividing by the number of
-        cells instead made the KD term negligible next to the CE term.
+        The KL is meaned over the U+1 prediction axis per frame, summed over valid
+        frames, and averaged over the (sub-)batch — the 2-D analogue of the CTC
+        per-frame KD — so it scales with T like the per-sequence RNNT NLL
+        (``_rnnt_loss``, ``reduction="mean"``). A plain per-cell mean makes KD
+        negligible; a full T x (U+1) sum makes it ~U-times too large and diverges.
         """
         dev = student_logits.device
         teacher_logits = teacher_logits.to(dev)
@@ -353,8 +354,16 @@ class GigaAMFineTuner(pl.LightningModule):
         # final blank emission (max_u1 = tok_lens.max() + 1).
         u_mask = torch.arange(U1, device=dev)[None, :] <= tok_lens.to(dev)[:, None]
         cell_mask = (t_mask.unsqueeze(2) & u_mask.unsqueeze(1)).to(kl.dtype)
+        # Per-frame KD: mean KL over the valid prediction positions (U+1 axis),
+        # then summed over valid frames and averaged over the batch. This mirrors
+        # the CTC per-frame KD (sum over T frames / batch), so the RNNT KD scales
+        # with T like the per-sequence RNNT NLL. Summing over the whole T x (U+1)
+        # lattice instead scales the term (and its gradient) by ~U, which dwarfs
+        # the CE term and destabilises training.
+        u_valid = cell_mask.sum(dim=2).clamp(min=1.0)          # [b, T] valid U per frame
+        per_frame_kl = (kl * cell_mask).sum(dim=2) / u_valid   # [b, T]
         batch = student_logits.size(0)
-        return (kl * cell_mask).sum() / max(batch, 1)
+        return (per_frame_kl * t_mask.to(kl.dtype)).sum() / max(batch, 1)
 
     def _rnnt_forward(
         self,
