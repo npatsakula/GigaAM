@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to activation_scales.json from gigaam.fp8.calibrate (FP8 mode).",
     )
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the encoder (and the KD teacher, in FP8 mode) with "
+        "dynamic shapes. Worthwhile on fp8-capable GPUs (Hopper/Ada/MI300X); on "
+        "Ampere the E4M3 cast can't be codegen'd by Triton so FP8Linear falls back "
+        "to eager and the speedup is negligible (~1x) for a large compile cost.",
+    )
 
     args = p.parse_args()
     assert (args.max_steps is not None) ^ (
@@ -184,6 +192,7 @@ def main():
         fp8=args.fp8,
         kd_alpha=args.kd_alpha,
         calibration_scales=args.calibration_scales,
+        compile=args.compile,
         cli_args=vars(args),
     )
 

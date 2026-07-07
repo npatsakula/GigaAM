@@ -35,6 +35,7 @@ class GigaAMFineTuner(pl.LightningModule):
         fp8: bool = False,
         kd_alpha: float = 0.5,
         calibration_scales: Optional[str] = None,
+        compile: bool = False,
         cli_args: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
@@ -156,6 +157,26 @@ class GigaAMFineTuner(pl.LightningModule):
                     "enable quantization-aware training.",
                     stacklevel=2,
                 )
+
+        if compile:
+            # Compile the encoder(s) in place. nn.Module.compile() keeps the module
+            # identity and state_dict keys intact (unlike torch.compile(m), which
+            # wraps in an OptimizedModule and prefixes keys with "_orig_mod."), so
+            # checkpoints stay compatible with gigaam.load_model. dynamic=True avoids
+            # a recompile per audio length; suppress_errors falls back to eager for
+            # any op the backend can't codegen (e.g. the E4M3 cast on Ampere) instead
+            # of crashing a long run. Compilation itself is lazy (first forward).
+            import torch._dynamo
+
+            torch._dynamo.config.suppress_errors = True
+            self.encoder.compile(dynamic=True)
+            if self.teacher_encoder is not None:
+                self.teacher_encoder.compile(dynamic=True)
+            print(
+                "  torch.compile enabled on encoder"
+                + (" + teacher encoder" if self.teacher_encoder is not None else "")
+                + " (dynamic shapes; lazy-compiles on first step)"
+            )
 
         self._val_errors = self._val_words = 0
 
