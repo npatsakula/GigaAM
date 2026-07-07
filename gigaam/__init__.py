@@ -19,7 +19,16 @@ __all__ = [
     "load_audio",
     "format_time",
     "load_model",
+    "load_model_from_hf",
 ]
+
+
+def load_model_from_hf(*args, **kwargs):
+    """Lazy import to avoid a hard huggingface_hub dependency at package import."""
+    from .hf_loader import load_model_from_hf as _load
+
+    return _load(*args, **kwargs)
+
 
 # Default cache directory
 _CACHE_DIR = os.path.expanduser("~/.cache/gigaam")

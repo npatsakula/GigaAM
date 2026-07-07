@@ -7,3 +7,12 @@ build
 onnx
 train_utils/data
 train_utils/checkpoints
+
+# Large model / data artifacts (weights, calibration outputs, HF mirrors) — not source
+/data
+/eval_results
+/fp8_out
+/hf_package
+/hf_packages
+/hf_repo
+train_utils/hf_repo

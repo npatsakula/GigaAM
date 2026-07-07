@@ -60,6 +60,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--time_masks", type=int, default=2)
     p.add_argument("--time_width", type=int, default=20)
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
+    p.add_argument(
+        "--from_hf",
+        action="store_true",
+        help="Load the pretrained model from the HuggingFace mirror "
+        "(ai-sage/GigaAM-v3) instead of the default CDN. Use when the CDN is unreachable.",
+    )
+    p.add_argument(
+        "--fp8",
+        action="store_true",
+        help="FP8 QAT: quantize GEMM Linears to E4M3 (simulated) and "
+        "train with logit KD against a frozen fp16 teacher. CTC does "
+        "per-frame KD; RNNT does grid-level KD over the (T,U+1) lattice.",
+    )
+    p.add_argument(
+        "--kd_alpha",
+        type=float,
+        default=0.5,
+        help="Weight on the GT CE/RNNT loss; (1-alpha) on teacher KD (FP8 mode).",
+    )
+    p.add_argument(
+        "--calibration_scales",
+        type=str,
+        default=None,
+        help="Path to activation_scales.json from gigaam.fp8.calibrate (FP8 mode).",
+    )
 
     args = p.parse_args()
     assert (args.max_steps is not None) ^ (
@@ -84,7 +109,12 @@ def main():
     model_dir, tb_dir = prepare_experiment_dirs(args.output_dir, exp_name)
 
     print(f"Loading pretrained {args.model_name} ...")
-    model = gigaam.load_model(args.model_name, fp16_encoder=False, device="cpu")
+    if args.from_hf:
+        model = gigaam.load_model_from_hf(
+            args.model_name, fp16_encoder=False, device="cpu"
+        )
+    else:
+        model = gigaam.load_model(args.model_name, fp16_encoder=False, device="cpu")
     assert isinstance(
         model, gigaam.GigaAMASR
     ), "Fine-tuning expects an ASR model (GigaAMASR)"
@@ -151,6 +181,9 @@ def main():
         freq_width=args.freq_width,
         time_masks=args.time_masks,
         time_width=args.time_width,
+        fp8=args.fp8,
+        kd_alpha=args.kd_alpha,
+        calibration_scales=args.calibration_scales,
         cli_args=vars(args),
     )
 
