@@ -72,6 +72,39 @@ def parse_args() -> argparse.Namespace:
         help="torch.compile the encoder with dynamic shapes (Conformer fusion); "
         "helps fp16/bf16 fine-tunes on any GPU.",
     )
+    p.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Fine-tune a streaming encoder: chunked block attention + causal "
+        "convs/subsampling for fixed low-latency inference. Adds no parameters.",
+    )
+    p.add_argument(
+        "--chunk_size",
+        type=int,
+        default=8,
+        help="Streaming chunk in encoder frames (40 ms each). 8 = 320 ms latency.",
+    )
+    p.add_argument(
+        "--left_context_chunks",
+        type=int,
+        default=-1,
+        help="Streaming left-context window in chunks (-1 = unlimited past).",
+    )
+    p.add_argument(
+        "--kd_alpha",
+        type=float,
+        default=0.0,
+        help="Self-distillation weight: loss = kd_alpha*KL(teacher||student) + "
+        "(1-kd_alpha)*CTC. 0 disables KD (pure CTC on teacher pseudo-labels). "
+        "Requires --streaming; teacher = the offline model being converted.",
+    )
+    p.add_argument(
+        "--init_from",
+        type=str,
+        default=None,
+        help="Warm-start the (streaming) student's weights from this fine-tuned "
+        ".ckpt after enable_streaming. Teacher (for KD) stays the offline base.",
+    )
 
     args = p.parse_args()
     assert (args.max_steps is not None) ^ (
@@ -109,6 +142,36 @@ def main():
     if args.activation_checkpointing:
         model.encoder.activation_checkpointing = True
         print("Encoder: activation checkpointing on (per Conformer layer)")
+    teacher = None
+    if args.kd_alpha > 0:
+        assert args.streaming, "--kd_alpha requires --streaming"
+        import copy
+
+        # Snapshot the offline (non-streaming) encoder+head as a frozen teacher
+        # BEFORE enable_streaming replaces the encoder.
+        teacher = (copy.deepcopy(model.encoder), copy.deepcopy(model.head))
+        print("Self-distillation: frozen offline teacher snapshotted")
+    if args.streaming:
+        gigaam.model.enable_streaming(
+            model,
+            chunk_size=args.chunk_size,
+            left_context_chunks=args.left_context_chunks,
+        )
+        if args.init_from:
+            ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+            sd = {
+                k: v
+                for k, v in ckpt["state_dict"].items()
+                if k.startswith(("preprocessor.", "encoder.", "head."))
+            }
+            model.load_state_dict(sd, strict=True)
+            print(f"Warm-started streaming student from {args.init_from}")
+        lat_ms = args.chunk_size * 40
+        lc = "unlimited" if args.left_context_chunks < 0 else f"{args.left_context_chunks} chunks"
+        print(
+            f"Streaming: chunk={args.chunk_size} frames (~{lat_ms} ms), "
+            f"left context {lc} (causal convs/subsampling, block attention)"
+        )
     tokenizer = model.decoding.tokenizer
     blank_id = model.decoding.blank_id
     orig_model_name = model.cfg.model_name
@@ -169,8 +232,11 @@ def main():
         time_masks=args.time_masks,
         time_width=args.time_width,
         compile=args.compile,
+        kd_alpha=args.kd_alpha,
         cli_args=vars(args),
     )
+    if teacher is not None:
+        lit.set_teacher(teacher[0], teacher[1])
 
     ckpt_cb = ModelCheckpoint(
         dirpath=model_dir,

@@ -31,6 +31,7 @@ class GigaAMFineTuner(pl.LightningModule):
         time_masks: int = 2,
         time_width: int = 20,
         compile: bool = False,
+        kd_alpha: float = 0.0,
         cli_args: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
@@ -70,6 +71,8 @@ class GigaAMFineTuner(pl.LightningModule):
 
         self._lr, self._wd = lr, weight_decay
         self._warmup_ratio = warmup_ratio
+        self._kd_alpha = kd_alpha
+        self._teacher: Optional[Tuple[nn.Module, nn.Module]] = None
         self._log_every, self._last_log_step = log_every_n_steps, -1
 
         for p in self.preprocessor.parameters():
@@ -127,16 +130,51 @@ class GigaAMFineTuner(pl.LightningModule):
             fused_log_softmax=True,
         )
 
-    def _encode(self, wavs: Tensor, wav_lens: Tensor) -> Tuple[Tensor, Tensor]:
+    def _features(self, wavs: Tensor, wav_lens: Tensor) -> Tuple[Tensor, Tensor]:
         amp_dev = next(self.parameters()).device.type
         with torch.amp.autocast(amp_dev, enabled=False):
             features, feat_lens = self.preprocessor(wavs.float(), wav_lens)
+        return features, feat_lens
+
+    def _augment(self, features: Tensor) -> Tensor:
         if self.training and self._spec_augment:
             for aug in self._freq_aug:
                 features = aug(features)
             for aug in self._time_aug:
                 features = aug(features)
+        return features
+
+    def _encode(self, wavs: Tensor, wav_lens: Tensor) -> Tuple[Tensor, Tensor]:
+        features, feat_lens = self._features(wavs, wav_lens)
+        features = self._augment(features)
         return self.encoder(features, feat_lens)
+
+    def set_teacher(self, encoder: nn.Module, head: nn.Module) -> None:
+        """Attach a frozen offline (non-streaming) teacher for self-distillation.
+        Stored as a plain tuple so it is neither in ``state_dict`` (no checkpoint
+        bloat) nor in ``parameters()`` (not optimized)."""
+        for m in (encoder, head):
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+        self._teacher = (encoder, head)
+
+    def _kd_loss(
+        self, student_logp: Tensor, teacher_logp: Tensor, enc_lens: Tensor
+    ) -> Tensor:
+        """Per-frame KL(teacher || student) on CTC log-probs, masked to valid
+        frames. Teacher and student share T exactly (causal padding preserves
+        length), so no alignment is needed."""
+        T = student_logp.shape[1]
+        mask = torch.arange(T, device=student_logp.device)[None, :] < enc_lens[
+            :, None
+        ].to(student_logp.device)
+        kl = (teacher_logp.exp() * (teacher_logp - student_logp)).sum(-1)  # [B,T]
+        return (kl * mask).sum() / mask.sum().clamp(min=1)
+
+    def on_fit_start(self) -> None:
+        if getattr(self, "_teacher", None) is not None:
+            self._teacher = tuple(m.to(self.device) for m in self._teacher)
 
     def _rnnt_joint(self, encoded: Tensor, tokens: Tensor) -> Tensor:
         head = self.head
@@ -199,13 +237,28 @@ class GigaAMFineTuner(pl.LightningModule):
 
     def training_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
         wavs, wav_lens, tokens, tok_lens = batch
-        encoded, enc_lens = self._encode(wavs, wav_lens)
 
-        if self.mode == "ctc":
+        kd_active = self._teacher is not None and self._kd_alpha > 0 and self.mode == "ctc"
+        if kd_active:
+            # Student sees SpecAugmented features; teacher sees clean ones.
+            feats, feat_lens = self._features(wavs, wav_lens)
+            encoded, enc_lens = self.encoder(self._augment(feats), feat_lens)
             log_probs = self.head(encoded)
-            loss = self._ctc_loss(log_probs, tokens, enc_lens, tok_lens)
+            ctc = self._ctc_loss(log_probs, tokens, enc_lens, tok_lens)
+            with torch.no_grad():
+                t_enc, _ = self._teacher[0](feats, feat_lens)
+                t_logp = self._teacher[1](t_enc)
+            kd = self._kd_loss(log_probs, t_logp, enc_lens)
+            loss = self._kd_alpha * kd + (1.0 - self._kd_alpha) * ctc
+            self.log("train/kd", kd, prog_bar=True)
+            self.log("train/ctc", ctc)
         else:
-            loss = self._rnnt_forward(encoded, enc_lens, tokens, tok_lens)
+            encoded, enc_lens = self._encode(wavs, wav_lens)
+            if self.mode == "ctc":
+                log_probs = self.head(encoded)
+                loss = self._ctc_loss(log_probs, tokens, enc_lens, tok_lens)
+            else:
+                loss = self._rnnt_forward(encoded, enc_lens, tokens, tok_lens)
         self.log("train/loss", loss, prog_bar=True)
 
         if (

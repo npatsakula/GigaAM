@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Union
 import torch
 from tqdm import tqdm
 
-from .model import GigaAM, GigaAMASR, GigaAMEmo
+from .model import GigaAM, GigaAMASR, GigaAMEmo, enable_streaming
 from .preprocess import load_audio
 from .utils import format_time
 
@@ -16,6 +16,7 @@ __all__ = [
     "GigaAM",
     "GigaAMASR",
     "GigaAMEmo",
+    "enable_streaming",
     "load_audio",
     "format_time",
     "load_model",
@@ -149,19 +150,45 @@ def load_model(
     if os.path.isfile(local_path):
         finetuned = torch.load(local_path, map_location="cpu", weights_only=False)
         base_name = finetuned["hyper_parameters"]["model_name"]
-        model = load_model(
-            base_name,
-            fp16_encoder=fp16_encoder,
-            use_flash=use_flash,
-            device=device_obj,
-            download_root=download_root,
-        )
+        from_hf = bool(finetuned["hyper_parameters"].get("from_hf"))
+        try:
+            if from_hf:
+                raise RuntimeError("fine-tune used the HF mirror")
+            model = load_model(
+                base_name,
+                fp16_encoder=fp16_encoder,
+                use_flash=use_flash,
+                device=device_obj,
+                download_root=download_root,
+            )
+        except Exception:
+            # Fall back to the HuggingFace mirror when the CDN is unreachable or
+            # the base was fetched from HF during fine-tuning (e.g. e2e_ctc).
+            model = load_model_from_hf(
+                base_name,
+                fp16_encoder=fp16_encoder,
+                device=device_obj,
+                download_root=download_root,
+            )
         sd = {
             k: v
             for k, v in finetuned["state_dict"].items()
             if k.startswith(("preprocessor.", "encoder.", "head."))
         }
         model.load_state_dict(sd)
+        # Restore streaming mode if the model was fine-tuned for it. Streaming
+        # adds no parameters, so the state_dict above already loaded correctly;
+        # here we only rebuild the encoder's forward behaviour (causal padding +
+        # chunked attention) from the persisted hyper-parameters.
+        hp = finetuned.get("hyper_parameters", {})
+        if hp.get("streaming"):
+            from .model import enable_streaming
+
+            enable_streaming(
+                model,
+                chunk_size=hp.get("chunk_size", 8),
+                left_context_chunks=hp.get("left_context_chunks", -1),
+            )
         return model
 
     model_name, model_path = _download_model(model_name, download_root)

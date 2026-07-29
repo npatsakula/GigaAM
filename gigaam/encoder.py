@@ -29,6 +29,22 @@ def _conformer_layer_fwd(
     return layer(x=x, pos_emb=pos_emb, att_mask=att_mask, pad_mask=pad_mask)
 
 
+class StreamingState:
+    """
+    Mutable per-utterance cache for cache-aware streaming inference. Holds
+    everything needed so that feeding an utterance chunk-by-chunk reproduces the
+    full masked forward exactly: the rotary position offset, per-subsampling-stage
+    left-context frames, and per-Conformer-layer attention KV and depthwise-conv
+    caches.
+    """
+
+    def __init__(self, n_layers: int, n_subs_convs: int):
+        self.processed = 0  # encoder frames emitted so far (rotary offset)
+        self.subs_cache: List[Optional[Tensor]] = [None] * n_subs_convs
+        self.kv: List[Optional[Tuple[Tensor, Tensor]]] = [None] * n_layers
+        self.conv: List[Optional[Tensor]] = [None] * n_layers
+
+
 class StridingSubsampling(nn.Module):
     """
     Strided Subsampling layer used to reduce the sequence length.
@@ -42,6 +58,7 @@ class StridingSubsampling(nn.Module):
         feat_in: int,
         feat_out: int,
         conv_channels: int,
+        causal: bool = False,
     ):
         super().__init__()
         self.subsampling_type = subsampling
@@ -49,7 +66,16 @@ class StridingSubsampling(nn.Module):
         self._sampling_num = int(math.log(subsampling_factor, 2))
         self._stride = 2
         self._kernel_size = kernel_size
-        self._padding = (self._kernel_size - 1) // 2
+        self.causal = causal
+        # Causal streaming pads only on the left (kernel-1, applied manually in
+        # forward) so an output frame never reads future input; symmetric
+        # otherwise. Both schemes sum to the same total padding (kernel-1 for
+        # odd kernels), so calc_output_length -- which uses _pad_total -- is
+        # identical either way and no length bookkeeping changes.
+        self._padding = 0 if causal else (self._kernel_size - 1) // 2
+        self._pad_total = (
+            self._kernel_size - 1 if causal else 2 * self._padding
+        )
 
         layers: List[nn.Module] = []
         in_channels = 1 if self.subsampling_type == "conv2d" else feat_in
@@ -83,7 +109,7 @@ class StridingSubsampling(nn.Module):
         """
         if num_stages is None:
             num_stages = self._sampling_num
-        add_pad = 2 * self._padding - self._kernel_size
+        add_pad = self._pad_total - self._kernel_size
         lengths = lengths.to(torch.float)
         for _ in range(num_stages):
             lengths = torch.floor((lengths + add_pad) / self._stride + 1.0)
@@ -117,6 +143,14 @@ class StridingSubsampling(nn.Module):
         cur_len = lengths
         x = self._mask_time(x, cur_len)
         for module in self.conv:
+            if self.causal and isinstance(module, (torch.nn.Conv1d, torch.nn.Conv2d)):
+                # Left-pad the time axis (last dim for both conv1d [b,c,t] and
+                # conv2d [b,c,t,f]) so the strided conv only sees past frames.
+                pad = (0, 0, self._kernel_size - 1, 0) if x.dim() == 4 else (
+                    self._kernel_size - 1,
+                    0,
+                )
+                x = F.pad(x, pad)
             x = module(x)
             if isinstance(module, (torch.nn.Conv1d, torch.nn.Conv2d)):
                 cur_len = self.calc_output_length(cur_len, 1)
@@ -128,6 +162,34 @@ class StridingSubsampling(nn.Module):
         else:
             x = x.transpose(1, 2)
         return x, self.calc_output_length(lengths)
+
+    def forward_streaming(self, x: Tensor, state: "StreamingState") -> Tensor:
+        """
+        Causal subsampling for one streaming chunk (conv1d only). ``x`` is
+        channels-first ``[b, feat_in, t]``. Each conv stage prepends its cached
+        last ``kernel-1`` input frames (zeros on the first chunk, which matches
+        the full forward's causal left-pad) instead of zero-padding, so the
+        concatenation of all chunks reproduces the full forward exactly.
+        """
+        assert self.subsampling_type == "conv1d" and self.causal
+        out = x
+        ci = 0
+        left = self._kernel_size - 1
+        for module in self.conv:
+            if isinstance(module, torch.nn.Conv1d):
+                cache = state.subs_cache[ci]
+                if cache is None:
+                    cache = torch.zeros(
+                        out.shape[0], out.shape[1], left,
+                        device=out.device, dtype=out.dtype,
+                    )
+                inp = torch.cat([cache, out], dim=2)
+                state.subs_cache[ci] = inp[:, :, inp.shape[2] - left:]
+                out = module(inp)
+                ci += 1
+            else:
+                out = module(out)  # ReLU
+        return out  # [b, d_model, t_enc]
 
 
 class MultiHeadAttention(nn.Module, ABC):
@@ -276,6 +338,37 @@ class RotaryPositionMultiHeadAttention(MultiHeadAttention):
             scores = torch.matmul(q, k.transpose(-2, -1) / math.sqrt(self.d_k))
             return self.forward_attention(v, scores, mask)
 
+    def forward_streaming(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        kv_cache: Optional[Tuple[Tensor, Tensor]],
+    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+        """
+        Cache-aware self-attention for one chunk. ``x`` is ``[b, n, d]``; ``cos``/
+        ``sin`` are the rotary tables sliced to this chunk's absolute positions
+        ``[J, J+n)`` (so ``offset=0`` here). New keys/values are appended to the
+        running cache and the query attends to the full left context + current
+        chunk with no mask -- which reproduces the training block mask under
+        unlimited left context. Keys are cached post-rotation; cached keys are
+        never re-rotated (RoPE relative-phase property preserves parity).
+        """
+        b, n, _ = x.shape
+        xh = x.transpose(0, 1).view(n, b, self.h, self.d_k)
+        xq, xk = apply_rotary_pos_emb(xh, xh, cos, sin, offset=0)
+        q, k, v = self.forward_qkv(
+            xq.view(n, b, self.h * self.d_k).transpose(0, 1),
+            xk.view(n, b, self.h * self.d_k).transpose(0, 1),
+            x,
+        )  # q, k, v: [b, h, n, d_k]
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k], dim=2)
+            v = torch.cat([kv_cache[1], v], dim=2)
+        attn_output = F.scaled_dot_product_attention(q, k, v)
+        attn_output = attn_output.transpose(1, 2).reshape(b, n, self.h * self.d_k)
+        return self.linear_out(attn_output), (k, v)
+
 
 class PositionalEncoding(nn.Module, ABC):
     """
@@ -371,17 +464,23 @@ class ConformerConvolution(nn.Module):
         d_model: int,
         kernel_size: int,
         norm_type: str,
+        causal: bool = False,
     ):
         super().__init__()
         assert (kernel_size - 1) % 2 == 0
         assert norm_type in ["batch_norm", "layer_norm"]
         self.norm_type = norm_type
+        self.causal = causal
+        self.kernel_size = kernel_size
+        # Causal depthwise conv left-pads by kernel-1 (applied in forward) so a
+        # frame only sees itself and the past; symmetric padding looks ahead by
+        # (kernel-1)//2 and would compound that lookahead across every layer.
         self.pointwise_conv1 = nn.Conv1d(d_model, d_model * 2, kernel_size=1)
         self.depthwise_conv = nn.Conv1d(
             in_channels=d_model,
             out_channels=d_model,
             kernel_size=kernel_size,
-            padding=(kernel_size - 1) // 2,
+            padding=0 if causal else (kernel_size - 1) // 2,
             groups=d_model,
             bias=True,
         )
@@ -399,6 +498,8 @@ class ConformerConvolution(nn.Module):
         x = nn.functional.glu(x, dim=1)
         if pad_mask is not None:
             x = x.masked_fill(pad_mask.unsqueeze(1), 0.0)
+        if self.causal:
+            x = F.pad(x, (self.kernel_size - 1, 0))
         x = self.depthwise_conv(x)
         if self.norm_type == "batch_norm":
             x = self.batch_norm(x)
@@ -407,6 +508,35 @@ class ConformerConvolution(nn.Module):
         x = self.activation(x)
         x = self.pointwise_conv2(x)
         return x.transpose(1, 2)
+
+    def forward_streaming(
+        self, x: Tensor, conv_cache: Optional[Tensor]
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Causal conv for one chunk. ``x`` is ``[b, t, d]``. The depthwise conv's
+        left context is supplied by ``conv_cache`` (its last ``kernel-1`` input
+        frames; zeros on the first chunk, matching the training left-pad) instead
+        of zero-padding. Returns the output and the updated cache.
+        """
+        assert self.causal
+        x = x.transpose(1, 2)  # [b, d, t]
+        x = self.pointwise_conv1(x)
+        x = nn.functional.glu(x, dim=1)
+        left = self.kernel_size - 1
+        if conv_cache is None:
+            conv_cache = torch.zeros(
+                x.shape[0], x.shape[1], left, device=x.device, dtype=x.dtype
+            )
+        inp = torch.cat([conv_cache, x], dim=2)
+        new_cache = inp[:, :, inp.shape[2] - left:]
+        x = self.depthwise_conv(inp)
+        if self.norm_type == "batch_norm":
+            x = self.batch_norm(x)
+        else:
+            x = self.batch_norm(x.transpose(1, 2)).transpose(1, 2)
+        x = self.activation(x)
+        x = self.pointwise_conv2(x)
+        return x.transpose(1, 2), new_cache
 
 
 class ConformerFeedForward(nn.Module):
@@ -441,6 +571,7 @@ class ConformerLayer(nn.Module):
         conv_norm_type: str = "batch_norm",
         conv_kernel_size: int = 31,
         flash_attn: bool = False,
+        causal: bool = False,
     ):
         super().__init__()
         self.fc_factor = 0.5
@@ -451,6 +582,7 @@ class ConformerLayer(nn.Module):
             d_model=d_model,
             kernel_size=conv_kernel_size,
             norm_type=conv_norm_type,
+            causal=causal,
         )
         self.norm_self_att = nn.LayerNorm(d_model)
         if self_attention_model == "rotary":
@@ -497,6 +629,36 @@ class ConformerLayer(nn.Module):
         x = self.norm_out(residual)
         return x
 
+    def forward_streaming(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        kv_cache: Optional[Tuple[Tensor, Tensor]],
+        conv_cache: Optional[Tensor],
+    ) -> Tuple[Tensor, Tuple[Tensor, Tensor], Tensor]:
+        """Cache-aware Conformer block for one chunk. Mirrors ``forward`` exactly
+        but threads the attention KV-cache and depthwise-conv cache."""
+        residual = x
+        x = self.norm_feed_forward1(x)
+        x = self.feed_forward1(x)
+        residual = residual + x * self.fc_factor
+
+        x = self.norm_self_att(residual)
+        x, new_kv = self.self_attn.forward_streaming(x, cos, sin, kv_cache)
+        residual = residual + x
+
+        x = self.norm_conv(residual)
+        x, new_conv = self.conv.forward_streaming(x, conv_cache)
+        residual = residual + x
+
+        x = self.norm_feed_forward2(residual)
+        x = self.feed_forward2(x)
+        residual = residual + x * self.fc_factor
+
+        x = self.norm_out(residual)
+        return x, new_kv, new_conv
+
 
 class ConformerEncoder(nn.Module):
     """
@@ -523,10 +685,28 @@ class ConformerEncoder(nn.Module):
         conv_kernel_size: int = 31,
         flash_attn: bool = False,
         activation_checkpointing: bool = False,
+        streaming: bool = False,
+        chunk_size: int = 8,
+        left_context_chunks: int = -1,
     ):
         super().__init__()
         self.feat_in = feat_in
         self.activation_checkpointing = activation_checkpointing
+        # Streaming turns the encoder into a chunked, limited-right-context model:
+        # causal subsampling/conv + block attention (queries in chunk i see only
+        # chunks <= i). chunk_size is in encoder frames (40 ms each); -1 left
+        # context means unlimited past. Adds no parameters -- only masking and
+        # causal padding change -- so pretrained weights load unchanged.
+        self.streaming = streaming
+        self.chunk_size = chunk_size
+        self.left_context_chunks = left_context_chunks
+        if streaming:
+            assert self_attention_model == "rotary", (
+                "streaming supports only rotary attention"
+            )
+            # Block attention masks can't be expressed through the flash-attn
+            # path; force torch sdpa, which accepts an arbitrary bool att_mask.
+            flash_attn = False
         assert self_attention_model in [
             "rotary",
             "rel_pos",
@@ -539,6 +719,7 @@ class ConformerEncoder(nn.Module):
             feat_in=feat_in,
             feat_out=d_model,
             conv_channels=d_model,
+            causal=streaming,
         )
 
         self.pos_emb_max_len = pos_emb_max_len
@@ -569,6 +750,7 @@ class ConformerEncoder(nn.Module):
                 conv_norm_type=conv_norm_type,
                 conv_kernel_size=conv_kernel_size,
                 flash_attn=flash_attn,
+                causal=streaming,
             )
             self.layers.append(layer)
 
@@ -612,6 +794,23 @@ class ConformerEncoder(nn.Module):
             "encoded_len": {0: "batch_size"},
         }
 
+    def _chunk_att_mask(self, seq_len: int, device: torch.device) -> Tensor:
+        """
+        Block (chunk-limited) attention mask in encoder-frame space, using the
+        codebase convention True = disallowed. A query in chunk ``c(q)=q//chunk``
+        may attend to a key in chunk ``c(k)`` iff ``c(k) <= c(q)`` and (for a
+        bounded window) ``c(k) >= c(q) - left_context_chunks``. Because the chunk
+        boundary is shared by every layer, the right-context lookahead is exactly
+        one chunk and does not compound with depth.
+        """
+        idx = torch.arange(seq_len, device=device)
+        cq = (idx // self.chunk_size).unsqueeze(1)  # [T, 1]
+        ck = (idx // self.chunk_size).unsqueeze(0)  # [1, T]
+        disallow = ck > cq  # future chunks
+        if self.left_context_chunks >= 0:
+            disallow = disallow | (ck < (cq - self.left_context_chunks))
+        return disallow  # [T, T], True = masked
+
     def forward(self, audio_signal: Tensor, length: Tensor) -> Tuple[Tensor, Tensor]:
         if not hasattr(self.pos_enc, "pe"):
             self.pos_enc.extend_pe(self.pos_emb_max_len, audio_signal.device)
@@ -628,7 +827,14 @@ class ConformerEncoder(nn.Module):
         ) < length.unsqueeze(-1)
 
         att_mask = None
-        if audio_signal.shape[0] > 1:
+        if self.streaming:
+            # Always build a chunked mask (even at batch 1). Mask only padded
+            # *keys*, never whole query rows -- a valid query always sees at
+            # least its own (valid) frame, so no softmax row is fully masked.
+            block = self._chunk_att_mask(max_len, audio_signal.device)  # [T,T]
+            key_pad = ~pad_mask  # [B, T], True where key is padding
+            att_mask = block.unsqueeze(0) | key_pad.unsqueeze(1)  # [B, T, T]
+        elif audio_signal.shape[0] > 1:
             att_mask = pad_mask.unsqueeze(1).repeat([1, max_len, 1])
             att_mask = torch.logical_and(att_mask, att_mask.transpose(1, 2))
             att_mask = ~att_mask
@@ -655,3 +861,48 @@ class ConformerEncoder(nn.Module):
                 )
 
         return audio_signal.transpose(1, 2), length
+
+    def init_streaming_state(self) -> StreamingState:
+        """Fresh per-utterance cache for :meth:`forward_streaming_chunk`."""
+        n_subs = sum(
+            1 for m in self.pre_encode.conv if isinstance(m, torch.nn.Conv1d)
+        )
+        return StreamingState(len(self.layers), n_subs)
+
+    def forward_streaming_chunk(
+        self, feat_chunk: Tensor, state: StreamingState
+    ) -> Tensor:
+        """
+        Encode one streaming chunk of features, updating ``state`` in place.
+        ``feat_chunk`` is channels-first ``[b, feat_in, t_feat]`` (raw log-mel,
+        e.g. 32 feature frames -> 8 encoder frames at chunk_size=8). Returns the
+        encoded chunk ``[b, d_model, n_enc]``. Concatenating the outputs over all
+        chunks reproduces ``forward`` on the whole utterance (verified by parity
+        test); this is the real-time inference path.
+        """
+        assert self.streaming, "forward_streaming_chunk requires streaming=True"
+        if not hasattr(self.pos_enc, "pe"):
+            self.pos_enc.extend_pe(self.pos_emb_max_len, feat_chunk.device)
+
+        x = self.pre_encode.forward_streaming(feat_chunk, state)  # [b, d, n]
+        x = x.transpose(1, 2)  # [b, n, d]
+        n = x.shape[1]
+        if n == 0:
+            return x.transpose(1, 2)
+
+        j = state.processed
+        pe = self.pos_enc.pe
+        half = pe.shape[0] // 2
+        assert j + n <= half, (
+            f"streaming position {j + n} exceeds pos_emb_max_len={half}; "
+            "increase pos_emb_max_len for longer streams"
+        )
+        cos = pe[j : j + n]
+        sin = pe[half + j : half + j + n]
+
+        for i, layer in enumerate(self.layers):
+            x, state.kv[i], state.conv[i] = layer.forward_streaming(
+                x, cos, sin, state.kv[i], state.conv[i]
+            )
+        state.processed += n
+        return x.transpose(1, 2)  # [b, d, n]

@@ -95,6 +95,32 @@ class CTCGreedyDecoding:
             for ids, fr in zip(ids_splits, fr_splits)
         ]
 
+    def decode_chunk(
+        self,
+        log_probs_chunk: Tensor,
+        last_label: int,
+        frame_offset: int,
+    ) -> Tuple[List[int], List[int], int]:
+        """
+        Incremental CTC greedy collapse for one streaming chunk (batch size 1).
+        Applies the same rule as :meth:`decode` -- emit a label when it is not
+        blank and differs from the previous frame's label -- but carries
+        ``last_label`` across the chunk boundary so the dedup at the first frame
+        of the chunk is correct. Returns (new token ids, their absolute frames,
+        updated last_label). Accumulate ids across chunks and ``tokenizer.decode``
+        them once at the end (equals the offline result).
+        """
+        labels = log_probs_chunk.argmax(dim=-1)[0].tolist()
+        ids: List[int] = []
+        frames: List[int] = []
+        prev = last_label
+        for i, lab in enumerate(labels):
+            if lab != self.blank_id and lab != prev:
+                ids.append(lab)
+                frames.append(frame_offset + i)
+            prev = lab
+        return ids, frames, prev
+
 
 class RNNTGreedyDecoding:
     """

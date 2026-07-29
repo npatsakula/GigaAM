@@ -13,6 +13,33 @@ from .utils import AudioDataset, onnx_converter
 LONGFORM_THRESHOLD = 25 * SAMPLE_RATE
 
 
+def enable_streaming(
+    model: "GigaAM", chunk_size: int = 8, left_context_chunks: int = -1
+) -> "GigaAM":
+    """
+    Rebuild ``model.encoder`` in streaming mode (chunked block attention + causal
+    subsampling/convs) in place, preserving weights. Streaming adds no parameters,
+    so the existing encoder state_dict loads strict. ``chunk_size`` is in encoder
+    frames (40 ms each; 8 = 320 ms latency); ``left_context_chunks=-1`` means
+    unlimited past. Also records the config on ``model.cfg.encoder`` so it round-
+    trips through checkpoints.
+    """
+    cfg = model.cfg
+    omegaconf.OmegaConf.set_struct(cfg, False)
+    cfg.encoder.streaming = True
+    cfg.encoder.chunk_size = chunk_size
+    cfg.encoder.left_context_chunks = left_context_chunks
+    device = next(model.encoder.parameters()).device
+    dtype = next(model.encoder.parameters()).dtype
+    old_sd = model.encoder.state_dict()
+    keep_ac = getattr(model.encoder, "activation_checkpointing", False)
+    new_enc = hydra.utils.instantiate(cfg.encoder)
+    new_enc.load_state_dict(old_sd, strict=True)
+    new_enc.activation_checkpointing = keep_ac
+    model.encoder = new_enc.to(device=device, dtype=dtype)
+    return model
+
+
 class GigaAM(nn.Module):
     """
     Giga Acoustic Model: Self-Supervised Model for Speech Tasks
@@ -138,6 +165,59 @@ class GigaAMASR(GigaAM):
         encoded, encoded_len = self.forward(wav, length)
         text, words = self._decode(encoded, encoded_len, length, word_timestamps)[0]
         return TranscriptionResult(text=text, words=words)
+
+    @torch.inference_mode()
+    def transcribe_streaming(self, wav_file: str) -> TranscriptionResult:
+        """
+        Cache-aware streaming transcription (CTC models only). Encodes the audio
+        chunk-by-chunk through the streaming encoder -- reproducing the offline
+        result within numerical tolerance -- and collapses CTC output incrementally
+        across chunk boundaries. Requires a model loaded/fine-tuned in streaming
+        mode (``encoder.streaming``); see ``gigaam.enable_streaming``.
+
+        This reference driver preprocesses the whole file, then feeds fixed
+        feature blocks to emulate real-time arrival; a live driver would push
+        audio as it comes and keep a one-hop overlap for the ``center=False``
+        window. Output is identical either way.
+        """
+        from .decoding import CTCGreedyDecoding
+
+        assert getattr(self.encoder, "streaming", False), (
+            "model is not in streaming mode; load a streaming fine-tune or call "
+            "gigaam.enable_streaming(model)"
+        )
+        assert isinstance(self.decoding, CTCGreedyDecoding), (
+            "transcribe_streaming supports CTC models only"
+        )
+
+        wav, length = self.prepare_wav(wav_file)
+        features, _ = self.preprocessor(wav.float(), length)  # [1, feat, T_feat]
+        enc_dtype = next(self.encoder.parameters()).dtype
+        head_dtype = next(self.head.parameters()).dtype
+        features = features.to(enc_dtype)
+
+        sub_factor = 2 ** self.encoder.pre_encode._sampling_num
+        feat_per_chunk = self.encoder.chunk_size * sub_factor
+
+        state = self.encoder.init_streaming_state()
+        t_feat = features.shape[-1]
+        ids: List[int] = []
+        frames: List[int] = []
+        last_label = self.decoding.blank_id
+        enc_frame = 0
+        for s in range(0, t_feat, feat_per_chunk):
+            fc = features[:, :, s : s + feat_per_chunk]
+            enc_chunk = self.encoder.forward_streaming_chunk(fc, state)
+            log_probs = self.head(encoder_output=enc_chunk.to(head_dtype))  # [1, n, C]
+            new_ids, new_fr, last_label = self.decoding.decode_chunk(
+                log_probs, last_label, enc_frame
+            )
+            ids.extend(new_ids)
+            frames.extend(new_fr)
+            enc_frame += enc_chunk.shape[-1]
+
+        text = self.decoding.tokenizer.decode(ids)
+        return TranscriptionResult(text=text, words=None)
 
     def forward_for_export(
         self, features: Tensor, feature_lengths: Tensor
