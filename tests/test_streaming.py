@@ -99,6 +99,37 @@ def test_encoder_cache_parity(feat_frames):
     assert diff < 1e-4, f"cache parity broke: max|diff|={diff}"
 
 
+@pytest.mark.parametrize("left_context_chunks", [1, 2, 4])
+@pytest.mark.parametrize("feat_frames", [128, 200, 323])
+def test_bounded_left_context_cache_parity(left_context_chunks, feat_frames):
+    """A *bounded* left-context window must still reproduce the full masked
+    forward. The streaming attention cache must be evicted to the last
+    ``left_context_chunks`` chunks; without eviction it silently keeps the whole
+    past and diverges from the trained block mask."""
+    torch.manual_seed(0)
+    enc = ConformerEncoder(
+        **ENC_KW,
+        streaming=True,
+        chunk_size=CHUNK,
+        left_context_chunks=left_context_chunks,
+    ).eval()
+    x = torch.randn(1, 64, feat_frames)
+    lens = torch.tensor([feat_frames])
+    with torch.inference_mode():
+        full, _ = enc(x, lens)
+        state = enc.init_streaming_state()
+        outs = []
+        for s in range(0, feat_frames, CHUNK * SUB):
+            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
+        stream = torch.cat(outs, dim=2)
+    assert full.shape == stream.shape
+    diff = (full - stream).abs().max().item()
+    assert diff < 1e-4, (
+        f"bounded left_context={left_context_chunks}: cache parity broke: "
+        f"max|diff|={diff} (cache not evicted to the trained window?)"
+    )
+
+
 def test_incremental_collapse_parity():
     """Incremental cross-chunk CTC collapse == offline whole-sequence collapse on
     the same (synthetic) logits."""
@@ -148,6 +179,29 @@ def test_real_model_streaming_parity():
     full = model.transcribe(path).text
     stream = model.transcribe_streaming(path).text
     assert full == stream, f"driver text parity: {full!r} != {stream!r}"
+
+
+def test_enable_streaming_refuses_fp8_encoder():
+    """enable_streaming rebuilds the encoder fresh (plain nn.Linear), so it must
+    run BEFORE FP8 quantization. Calling it on an already-quantized encoder would
+    silently replace every FP8Linear with a plain Linear (act_scale is None while
+    uncalibrated, hence omitted from the state_dict, so the strict load succeeds
+    while wiping the quantization). It must refuse loudly instead."""
+    from gigaam.fp8.linear import FP8Linear
+    from gigaam.model import enable_streaming
+
+    enc = _streaming_encoder()
+    # Swap one Linear for an FP8Linear to simulate a post-quantize encoder.
+    enc.layers[0].feed_forward1.linear1 = FP8Linear.from_linear(
+        enc.layers[0].feed_forward1.linear1, compute_dtype=torch.float32
+    )
+
+    class _StubModel:
+        def __init__(self, encoder):
+            self.encoder = encoder
+
+    with pytest.raises(RuntimeError, match="BEFORE gigaam.fp8.quantize_model"):
+        enable_streaming(_StubModel(enc), chunk_size=CHUNK, left_context_chunks=-1)
 
 
 if __name__ == "__main__":

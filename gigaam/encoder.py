@@ -893,10 +893,14 @@ class ConformerEncoder(nn.Module):
         j = state.processed
         pe = self.pos_enc.pe
         half = pe.shape[0] // 2
-        assert j + n <= half, (
-            f"streaming position {j + n} exceeds pos_emb_max_len={half}; "
-            "increase pos_emb_max_len for longer streams"
-        )
+        # Grow the rotary buffer for streams longer than pos_emb_max_len (default
+        # 5000 -> half=2500 encoder frames ~= 100 s at 25 fps). Rotary cos/sin
+        # are position-wise, so extending the buffer does not change the values
+        # already emitted for earlier positions; it only appends higher indices.
+        if j + n > half:
+            self.pos_enc.extend_pe(j + n, feat_chunk.device)
+            pe = self.pos_enc.pe
+            half = pe.shape[0] // 2
         cos = pe[j : j + n]
         sin = pe[half + j : half + j + n]
 
@@ -904,5 +908,28 @@ class ConformerEncoder(nn.Module):
             x, state.kv[i], state.conv[i] = layer.forward_streaming(
                 x, cos, sin, state.kv[i], state.conv[i]
             )
+        # Bound the attention cache to the training left-context window. Each
+        # layer's kv[i] now holds every key/value this chunk attended to -- the
+        # previous cache plus this chunk's new frames (positions [j, j+n)). The
+        # next chunk's queries start at j+n and, under the block mask, may only
+        # see keys at positions >= (j+n) - left_context_chunks*chunk_size, so
+        # keep exactly that many trailing frames and drop the rest. With
+        # left_context_chunks=-1 (unlimited) we keep everything, which is what
+        # reproduces the unbounded training mask.
+        if self.left_context_chunks >= 0:
+            keep = self.left_context_chunks * self.chunk_size
+            state.kv = [self._trim_kv(kv, keep) for kv in state.kv]
         state.processed += n
         return x.transpose(1, 2)  # [b, d, n]
+
+    @staticmethod
+    def _trim_kv(
+        kv: Optional[Tuple[Tensor, Tensor]], keep: int
+    ) -> Optional[Tuple[Tensor, Tensor]]:
+        """Keep only the last ``keep`` time-frames of a cached (k, v) pair (dim 2)."""
+        if kv is None:
+            return None
+        k, v = kv
+        if k.size(2) <= keep:
+            return kv
+        return (k[:, :, -keep:, :], v[:, :, -keep:, :])

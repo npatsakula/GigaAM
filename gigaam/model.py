@@ -1,3 +1,4 @@
+import contextlib
 from typing import Dict, List, Optional, Tuple
 
 import hydra
@@ -23,7 +24,34 @@ def enable_streaming(
     frames (40 ms each; 8 = 320 ms latency); ``left_context_chunks=-1`` means
     unlimited past. Also records the config on ``model.cfg.encoder`` so it round-
     trips through checkpoints.
+
+    Order matters with FP8 quantization: this rebuilds the encoder fresh from
+    ``cfg.encoder`` (plain ``nn.Linear``), so it must run *before*
+    ``gigaam.fp8.quantize_model``. Calling it on an already-quantized encoder
+    would silently rebuild plain Linears and discard every ``FP8Linear`` (its
+    ``act_scale`` buffer is ``None`` while uncalibrated, hence absent from the
+    state_dict, so the strict load succeeds while wiping the quantization).
     """
+    # Guard: refuse to wipe an already-FP8-quantized encoder. Lazy import keeps
+    # fp8 an optional dependency.
+    try:
+        from .fp8.linear import FP8Linear
+    except Exception:  # fp8 extras not installed -> nothing to guard against
+        FP8Linear = None  # type: ignore[assignment]
+    if FP8Linear is not None:
+        has_fp8 = any(
+            isinstance(m, FP8Linear) for _, m in model.encoder.named_modules()
+        )
+        if has_fp8:
+            raise RuntimeError(
+                "enable_streaming must be called BEFORE gigaam.fp8.quantize_model. "
+                "The encoder is already FP8-quantized; rebuilding it here would "
+                "silently replace every FP8Linear with a plain nn.Linear (the "
+                "uncalibrated act_scale buffer is omitted from the state_dict, so "
+                "the strict load succeeds while discarding the quantization). "
+                "Re-enable streaming on the unquantized base, then quantize."
+            )
+
     cfg = model.cfg
     omegaconf.OmegaConf.set_struct(cfg, False)
     cfg.encoder.streaming = True
@@ -205,9 +233,19 @@ class GigaAMASR(GigaAM):
         frames: List[int] = []
         last_label = self.decoding.blank_id
         enc_frame = 0
+        # Mirror forward(): on GPU run the encoder under fp16 autocast (the encoder
+        # params are pre-halved when fp16_encoder=True, but the autocast context
+        # keeps fused/op behaviour identical to the offline path). On CPU the
+        # encoder runs in its native dtype with no autocast.
+        encoder_ctx = (
+            torch.autocast(device_type=self._device.type, dtype=torch.float16)
+            if self._device.type != "cpu"
+            else contextlib.nullcontext()
+        )
         for s in range(0, t_feat, feat_per_chunk):
             fc = features[:, :, s : s + feat_per_chunk]
-            enc_chunk = self.encoder.forward_streaming_chunk(fc, state)
+            with encoder_ctx:
+                enc_chunk = self.encoder.forward_streaming_chunk(fc, state)
             log_probs = self.head(encoder_output=enc_chunk.to(head_dtype))  # [1, n, C]
             new_ids, new_fr, last_label = self.decoding.decode_chunk(
                 log_probs, last_label, enc_frame
