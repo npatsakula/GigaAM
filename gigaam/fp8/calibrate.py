@@ -142,12 +142,48 @@ def main():
     p.add_argument(
         "--export_dir", default=None, help="If set, export the calibrated student here."
     )
+    p.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Patch the encoder into streaming mode (chunked block attention + "
+        "causal convs/subsampling) BEFORE quantization. The resulting FP8 student "
+        "is a streaming model; WER is measured through its chunked-mask forward. "
+        "Order matters: enable_streaming always runs before quantize_model.",
+    )
+    p.add_argument(
+        "--chunk_size",
+        type=int,
+        default=8,
+        help="Streaming chunk in encoder frames (40 ms each). 8 = 320 ms latency.",
+    )
+    p.add_argument(
+        "--left_context_chunks",
+        type=int,
+        default=-1,
+        help="Streaming left-context window in chunks (-1 = unlimited past).",
+    )
     args = p.parse_args()
 
     device = torch.device(args.device)
 
     print(f"Loading teacher {args.model_name} (fp16) ...")
     teacher = gigaam.load_model(args.model_name, fp16_encoder=True, device=device)
+
+    # --- Optional: convert the encoder to streaming mode BEFORE quantization ---
+    # enable_streaming rebuilds the encoder from plain nn.Linear, so it must run
+    # before quantize_model (which swaps in FP8Linear); the reverse order would
+    # silently wipe the quantization. See gigaam.model.enable_streaming.
+    if args.streaming:
+        print(
+            f"Patching encoder into streaming mode: chunk={args.chunk_size} frames "
+            f"(~{args.chunk_size * 40} ms), left_context="
+            f"{'unlimited' if args.left_context_chunks < 0 else args.left_context_chunks}"
+        )
+        gigaam.enable_streaming(
+            teacher,
+            chunk_size=args.chunk_size,
+            left_context_chunks=args.left_context_chunks,
+        )
 
     # --- Teacher WER baseline ---
     print("Measuring fp16 teacher WER ...")

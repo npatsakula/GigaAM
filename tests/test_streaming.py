@@ -204,5 +204,57 @@ def test_enable_streaming_refuses_fp8_encoder():
         enable_streaming(_StubModel(enc), chunk_size=CHUNK, left_context_chunks=-1)
 
 
+@pytest.mark.parametrize("left_context_chunks", [-1, 2])
+def test_fp8_streaming_composes(left_context_chunks):
+    """FP8 quantization composed with streaming (enable_streaming -> quantize,
+    the only valid order) must run end-to-end through the cache-aware path:
+    the streaming FP8 encoder produces finite, correctly-shaped output for both
+    bounded and unbounded left context.
+
+    Note this deliberately does NOT assert chunk-vs-full parity: per-tensor FP8
+    activation quantization is applied to different input distributions (a chunk
+    vs the whole sequence), so the chunked and full FP8 forwards legitimately
+    differ. The pure-encoder cache parity (no FP8) is covered by the other
+    parity tests; this test covers the FP8+streaming *integration*."""
+    from gigaam.fp8 import FP8Linear, quantize_model
+
+    torch.manual_seed(0)
+    enc = ConformerEncoder(
+        **ENC_KW,
+        streaming=True,
+        chunk_size=CHUNK,
+        left_context_chunks=left_context_chunks,
+    ).eval()
+    # Wrap in a minimal structure so quantize_model can find ``.encoder``.
+    import torch.nn as nn
+
+    class _Wrap(nn.Module):
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+
+    quantize_model(_Wrap(enc), compute_dtype=torch.float32)
+    assert any(isinstance(m, FP8Linear) for _, m in enc.named_modules()), (
+        "quantize_model swapped in no FP8Linear modules"
+    )
+
+    feat_frames = 200
+    x = torch.randn(1, 64, feat_frames)
+    lens = torch.tensor([feat_frames])
+    with torch.inference_mode():
+        full, _ = enc(x, lens)
+        state = enc.init_streaming_state()
+        outs = []
+        for s in range(0, feat_frames, CHUNK * SUB):
+            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
+        stream = torch.cat(outs, dim=2)
+    assert full.shape == stream.shape
+    assert torch.isfinite(stream).all(), "streaming FP8 output has NaN/Inf"
+    # The two paths track each other in magnitude (same order, finite).
+    rel = (full - stream).abs().max().item() / full.abs().max().item()
+    assert rel < 0.5, f"FP8 chunked path diverged wildly from full: rel={rel:.2f}"
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
