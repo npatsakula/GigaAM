@@ -315,6 +315,55 @@ def test_fp8_streaming_composes(left_context_chunks):
     assert rel < 0.5, f"FP8 chunked path diverged wildly from full: rel={rel:.2f}"
 
 
+def test_hf_streaming_config_round_trip():
+    """A streaming checkpoint published to HF round-trips: package_hf records the
+    mode as a top-level ``streaming`` block (NOT in the encoder cfg, so the stock
+    transformers modeling_gigaam.py still instantiates it), and load_model_from_hf's
+    restore logic rebuilds streaming mode from that block. No network needed: this
+    exercises the config helper + the loader's restore branch on a built config."""
+    from gigaam.fp8.package_hf import _streaming_meta_from_hp
+    from gigaam.hf_loader import _remap_targets
+
+    # --- packaging side: a streaming checkpoint's hyper-parameters -> config block ---
+    hp = {"streaming": True, "chunk_size": 8, "left_context_chunks": -1}
+    streaming_meta = _streaming_meta_from_hp(hp)
+    assert streaming_meta is not None and streaming_meta["enabled"] is True
+    assert streaming_meta["chunk_size"] == 8
+
+    # Non-streaming checkpoint yields no block.
+    assert _streaming_meta_from_hp({"model_name": "v3_ctc"}) is None
+
+    # --- the published config.json: base config + top-level streaming block ---
+    import omegaconf
+
+    import gigaam
+
+    raw = {
+        "cfg": {"model": {"cfg": omegaconf.OmegaConf.to_container(
+            gigaam.load_model("v3_ctc", device="cpu", fp16_encoder=False).cfg,
+            resolve=True,
+        )}},
+        "streaming": streaming_meta,
+    }
+    # Encoder cfg must stay pristine (no streaming ctor arg).
+    enc_cfg = raw["cfg"]["model"]["cfg"]["encoder"]
+    assert "streaming" not in enc_cfg, "encoder cfg must not carry streaming args"
+
+    # --- loader side: instantiate + restore (mirrors load_model_from_hf) ---
+    cfg = _remap_targets(omegaconf.OmegaConf.create(raw["cfg"]["model"]["cfg"]))
+    model = gigaam.GigaAMASR(cfg).eval()
+    assert not getattr(model.encoder, "streaming", False), "should load offline first"
+
+    sm = raw.get("streaming")
+    if sm and not getattr(model.encoder, "streaming", False):
+        gigaam.enable_streaming(
+            model,
+            chunk_size=sm.get("chunk_size", 8),
+            left_context_chunks=sm.get("left_context_chunks", -1),
+        )
+    assert model.encoder.streaming is True
+    assert hasattr(model, "transcribe_streaming")
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

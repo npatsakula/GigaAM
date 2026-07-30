@@ -53,6 +53,13 @@ VARIANTS = [
     ("ctc", "upstream/ctc"),
     ("e2e_rnnt", "upstream/e2e_rnnt"),
     ("rnnt", "upstream/rnnt"),
+    # Streaming variants: add one entry per streaming package you publish. The
+    # package dir is hf_packages/<variant>/ (e.g. e2e_ctc_streaming). Created from
+    # the matching base branch so config/modeling/tokenizer inherit correctly; the
+    # streaming mode is recorded as a top-level "streaming" block in config.json
+    # (see gigaam.fp8.package_hf) and reconstructed at load by load_model_from_hf.
+    # ("e2e_ctc_streaming", "upstream/e2e_ctc"),
+    # ("e2e_rnnt_streaming", "upstream/e2e_rnnt"),
 ]
 
 # Files copied from the matrix package into the branch working tree. README.md
@@ -173,12 +180,22 @@ def _verify_package(repo: str, variant: str, matrix_summary: Dict) -> None:
         with safe_open(str(p), framework="pt") as sf:
             bad = [k for k in sf.keys() if k.startswith("model.")]
             assert not bad, f"{variant}: {fn} has {len(bad)} model.-prefixed keys"
-    # config.json parses and model_name references the variant.
+    # config.json parses and model_name references the variant. Streaming variants
+    # carry a top-level "streaming" block (mirroring the "fp8" block); its presence
+    # is asserted separately below. The model_name check tolerates streaming
+    # variant names (e.g. "e2e_ctc_streaming" ⊂ "v3_e2e_ctc_streaming_fp8_kd").
     cfg = json.loads((work / "config.json").read_text())
     model_name = cfg.get("cfg", {}).get("model", {}).get("cfg", {}).get("model_name", "")
     assert variant in model_name, (
         f"{variant}: config model_name={model_name!r} does not reference the variant"
     )
+    # If this is a streaming package, the streaming block must be present and enabled.
+    if cfg.get("streaming"):
+        assert cfg["streaming"].get("enabled") is True, (
+            f"{variant}: streaming block present but not enabled"
+        )
+        print(f"  streaming variant: chunk={cfg['streaming'].get('chunk_size')} "
+              f"left_context={cfg['streaming'].get('left_context_chunks')}")
     # README.md must be unchanged (the script never overwrites it; this is a guard
     # against accidental external edits during staging).
     readme_status = subprocess.run(

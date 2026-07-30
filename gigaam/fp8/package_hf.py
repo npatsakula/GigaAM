@@ -55,6 +55,31 @@ def _load_student_state(ckpt_path: str) -> tuple[dict, dict]:
     return student, hp
 
 
+def _streaming_meta_from_hp(hp: dict) -> "Optional[dict]":
+    """Build a top-level ``streaming`` config block from checkpoint hyper-parameters,
+    or None for a non-streaming checkpoint.
+
+    Mirrors the FP8 ``fp8`` block convention: streaming mode is recorded at the top
+    level of config.json, NOT inside the encoder cfg, so the stock transformers
+    ``modeling_gigaam.py`` still instantiates the encoder (whose ctor has no
+    streaming args). ``gigaam.load_model_from_hf`` reads this block and rebuilds the
+    encoder in streaming mode after loading. See gigaam.model.enable_streaming.
+    """
+    if not hp.get("streaming"):
+        return None
+    return {
+        "enabled": True,
+        "chunk_size": hp.get("chunk_size", 8),
+        "left_context_chunks": hp.get("left_context_chunks", -1),
+        "latency_ms": hp.get("chunk_size", 8) * 40,
+        "note": (
+            "Cache-aware chunked Conformer (causal convs/subsampling + block "
+            "attention). Reconstructed at load by gigaam.load_model_from_hf / "
+            "gigaam.enable_streaming. Streaming adds no parameters."
+        ),
+    }
+
+
 def _quantize_fp8_weights(state_dict: dict) -> tuple[dict, dict]:
     """Split state_dict into (fp8-bytes+scales dict, plain fp16 dict).
 
@@ -133,6 +158,7 @@ def _write_package(
     activation_scales_path: "Optional[str]",
     kd_alpha: "Optional[float]" = None,
     trained_steps: "Optional[int]" = None,
+    streaming_meta: "Optional[dict]" = None,
 ) -> None:
     """Write the HF-ready package artifacts (shared by checkpoint & model paths)."""
     out = Path(out_dir)
@@ -173,10 +199,13 @@ def _write_package(
         "trained_steps": trained_steps,
     }
     raw_cfg["fp8"] = fp8_meta
+    if streaming_meta:
+        raw_cfg["streaming"] = streaming_meta
     raw_cfg["cfg"]["model"]["cfg"]["model_name"] = model_name
     with open(out / "config.json", "w") as f:
         json.dump(raw_cfg, f, indent=2, ensure_ascii=False)
-    print("  wrote config.json (with fp8 metadata)")
+    print("  wrote config.json (with fp8 metadata" + (
+        " + streaming" if streaming_meta else "") + ")")
 
     # 5. index map
     fp8_weight_keys = sorted(
@@ -212,11 +241,13 @@ def _fetch_config_and_meta(
     base_revision: str,
     kd_alpha: "Optional[float]" = None,
     trained_steps: "Optional[int]" = None,
+    streaming_meta: "Optional[dict]" = None,
 ) -> dict:
     """Fetch config/modeling/tokenizer from the base revision and write config.json.
 
     Shared by the HF-convention and native-convention packagers. Returns the raw
-    config dict (already written to ``out_dir/config.json`` with FP8 metadata).
+    config dict (already written to ``out_dir/config.json`` with FP8 metadata,
+    and a streaming block when ``streaming_meta`` is set).
     """
     out = Path(out_dir)
     print(f"Fetching base config/code from {HF_REPO}@{base_revision} ...")
@@ -233,10 +264,13 @@ def _fetch_config_and_meta(
         "trained_steps": trained_steps,
     }
     raw_cfg["fp8"] = fp8_meta
+    if streaming_meta:
+        raw_cfg["streaming"] = streaming_meta
     raw_cfg["cfg"]["model"]["cfg"]["model_name"] = model_name
     with open(out / "config.json", "w") as f:
         json.dump(raw_cfg, f, indent=2, ensure_ascii=False)
-    print("  wrote config.json (with fp8 metadata)")
+    print("  wrote config.json (with fp8 metadata" + (
+        " + streaming" if streaming_meta else "") + ")")
     return raw_cfg
 
 
@@ -263,6 +297,7 @@ def package_checkpoint(
         activation_scales_path=hp.get("calibration_scales"),
         kd_alpha=hp.get("kd_alpha"),
         trained_steps=hp.get("max_steps"),
+        streaming_meta=_streaming_meta_from_hp(hp),
     )
 
 
@@ -308,7 +343,7 @@ def package_checkpoint_native(
     Keys are the raw PyTorch state-dict names, matching ``pt_to_safetensors.py``.
     """
     print(f"Loading checkpoint {ckpt_path} ...")
-    student_sd, _ = _load_student_state(ckpt_path)
+    student_sd, hp = _load_student_state(ckpt_path)
     print(f"  student state_dict: {len(student_sd)} tensors")
     print("Splitting FP8 weights (uint8+scales) from fp16 parity ...")
     fp8_artifact, fp16_parity = _quantize_fp8_weights(student_sd)
@@ -357,6 +392,7 @@ def package_checkpoint_native(
         base_revision=base_revision,
         kd_alpha=kd_alpha,
         trained_steps=trained_steps,
+        streaming_meta=_streaming_meta_from_hp(hp),
     )
 
     print("\n=== Native package ready ===")

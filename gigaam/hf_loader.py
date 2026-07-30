@@ -164,6 +164,21 @@ def load_model_from_hf(
     if fp16_encoder and device.type != "cpu":
         model.encoder = model.encoder.half()
 
+    # Streaming checkpoints record their mode at the top level of config.json
+    # (a ``streaming`` block mirroring the FP8 ``fp8`` block -- NOT in the encoder
+    # cfg, which stays pristine so the stock transformers ``modeling_gigaam.py``
+    # still instantiates it). Rebuild the encoder in streaming mode from that block.
+    # See gigaam.model.enable_streaming and gigaam.fp8.package_hf.
+    streaming_meta = raw.get("streaming") if isinstance(raw, dict) else None
+    if streaming_meta and not getattr(model.encoder, "streaming", False):
+        from .model import enable_streaming
+
+        enable_streaming(
+            model,
+            chunk_size=streaming_meta.get("chunk_size", 8),
+            left_context_chunks=streaming_meta.get("left_context_chunks", -1),
+        )
+
     cfg.model_name = resolved_name
     model.cfg = cfg
     return model.to(device)
