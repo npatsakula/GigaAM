@@ -222,6 +222,33 @@ def test_incremental_collapse_parity():
     assert dec.tokenizer.decode(ids) == dec.tokenizer.decode(ref_ids)
 
 
+def test_merge_reemitted_tokens():
+    """CTCGreedyDecoding.merge_reemitted_tokens collapses the spurious re-emission
+    doubles (шш, кк) the streaming CTC head produces: same token separated by a
+    small frame gap (the signature is ~2 frames). Genuine adjacent-frame repeats
+    and widely-spaced repeats are preserved."""
+    from gigaam.decoding import CTCGreedyDecoding
+
+    merge = CTCGreedyDecoding.merge_reemitted_tokens
+    # Re-emission within the gap window (gap 2): the second 'ш' is dropped.
+    ids = [ord("а"), ord("ш"), ord("ш"), ord("т")]
+    frames = [0, 1, 3, 4]
+    m_ids, m_fr = merge(ids, frames, max_gap=2)
+    assert m_ids == [ord("а"), ord("ш"), ord("т")], f"failed to merge re-emission: {m_ids}"
+    # Widely-spaced repeat (gap 5 > max_gap): preserved (not a re-emission).
+    ids = [ord("а"), ord("а")]
+    frames = [0, 5]
+    m_ids, _ = merge(ids, frames, max_gap=2)
+    assert m_ids == [ord("а"), ord("а")], "wrongly merged a distant repeat"
+    # Distinct tokens are never touched.
+    ids = [1, 2, 3]
+    frames = [0, 1, 2]
+    assert merge(ids, frames, max_gap=2)[0] == [1, 2, 3]
+    # Empty / single-token inputs pass through.
+    assert merge([], [], max_gap=2) == ([], [])
+    assert merge([5], [7], max_gap=2) == ([5], [7])
+
+
 @pytest.mark.partial
 def test_real_model_streaming_parity():
     """End-to-end: on real v3_ctc weights patched into streaming mode, the

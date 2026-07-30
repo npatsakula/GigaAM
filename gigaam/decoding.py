@@ -121,6 +121,40 @@ class CTCGreedyDecoding:
             prev = lab
         return ids, frames, prev
 
+    @staticmethod
+    def merge_reemitted_tokens(
+        ids: List[int], frames: List[int], max_gap: int = 2
+    ) -> Tuple[List[int], List[int]]:
+        """Merge adjacent identical CTC tokens that are a re-emission artifact.
+
+        A streaming/quantized CTC head can emit the same token, waver (blank) for
+        a frame or two, and re-emit it -- producing spurious doubles like ``шш``
+        (Ильшат), ``кк`` (окко), ``ии`` (Евгении). These re-emissions share a
+        tight, consistent signature: the two identical tokens are separated by a
+        small frame gap (typically exactly 2 -- one blank frame between them,
+        which the per-frame collapse in :meth:`decode_chunk` cannot remove because
+        the intervening frame is blank, not the same token). A genuine doubled
+        letter would appear at adjacent frames (gap 1 with no blank) and is
+        essentially absent in Russian orthography.
+
+        Drop the second token of any adjacent identical pair whose frame gap is
+        <= ``max_gap``. Conservative: only fuses exact-same-token near-neighbours,
+        so it cannot alter distinct tokens or widely-spaced repeats.
+        """
+        if len(ids) < 2:
+            return ids, frames
+        out_ids: List[int] = [ids[0]]
+        out_frames: List[int] = [frames[0]]
+        for i in range(1, len(ids)):
+            if (
+                ids[i] == out_ids[-1]
+                and (frames[i] - out_frames[-1]) <= max_gap
+            ):
+                continue  # re-emission within the gap window: drop the duplicate
+            out_ids.append(ids[i])
+            out_frames.append(frames[i])
+        return out_ids, out_frames
+
 
 class RNNTGreedyDecoding:
     """

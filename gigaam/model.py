@@ -300,6 +300,13 @@ class GigaAMASR(GigaAM):
             ids.extend(new_ids)
             frames.extend(new_fr)
 
+        # CTC streaming/quantization can re-emit a token after a brief blank
+        # (spurious doubles like шш, кк -- a tight ~2-frame signature, see
+        # CTCGreedyDecoding.merge_reemitted_tokens). Collapse them before decode.
+        # RNN-T is unaffected (its predictor emits at most one token per step).
+        if is_ctc:
+            ids, frames = self.decoding.merge_reemitted_tokens(ids, frames)
+
         text = self.decoding.tokenizer.decode(ids)
         return TranscriptionResult(text=text, words=None)
 
