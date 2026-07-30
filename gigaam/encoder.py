@@ -36,6 +36,14 @@ class StreamingState:
     full masked forward exactly: the rotary position offset, per-subsampling-stage
     left-context frames, and per-Conformer-layer attention KV and depthwise-conv
     caches.
+
+    ``pending_feat`` is used only by the right-context (``right_context_chunks >
+    0``) defer path: it buffers ONE chunk's worth of *subsampled* features (the
+    layer-0 input) whose attention is still missing its 1-chunk look-ahead. The
+    next call pairs it with the freshly subsampled chunk so its queries can attend
+    to the look-ahead chunk's keys, after which it is emitted. It is always at
+    rotary offset ``self.processed`` and is ``None`` while empty (first call, and
+    after :meth:`flush_streaming`).
     """
 
     def __init__(self, n_layers: int, n_subs_convs: int):
@@ -43,6 +51,7 @@ class StreamingState:
         self.subs_cache: List[Optional[Tensor]] = [None] * n_subs_convs
         self.kv: List[Optional[Tuple[Tensor, Tensor]]] = [None] * n_layers
         self.conv: List[Optional[Tensor]] = [None] * n_layers
+        self.pending_feat: Optional[Tensor] = None
 
 
 class StridingSubsampling(nn.Module):
@@ -510,13 +519,23 @@ class ConformerConvolution(nn.Module):
         return x.transpose(1, 2)
 
     def forward_streaming(
-        self, x: Tensor, conv_cache: Optional[Tensor]
+        self,
+        x: Tensor,
+        conv_cache: Optional[Tensor],
+        lookahead_len: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         """
         Causal conv for one chunk. ``x`` is ``[b, t, d]``. The depthwise conv's
         left context is supplied by ``conv_cache`` (its last ``kernel-1`` input
         frames; zeros on the first chunk, matching the training left-pad) instead
         of zero-padding. Returns the output and the updated cache.
+
+        ``lookahead_len`` serves the right-context (defer=1) path. When ``x``
+        holds two chunks concatenated ``[pending, lookahead]`` and we only EMIT the
+        pending chunk, the cache must retain the pending chunk's tail -- NOT the
+        look-ahead chunk's tail -- so the next call's pending chunk is not
+        re-counted as its own left context. ``lookahead_len`` frames are skipped
+        before taking the trailing ``kernel-1`` cache slice.
         """
         assert self.causal
         x = x.transpose(1, 2)  # [b, d, t]
@@ -528,7 +547,12 @@ class ConformerConvolution(nn.Module):
                 x.shape[0], x.shape[1], left, device=x.device, dtype=x.dtype
             )
         inp = torch.cat([conv_cache, x], dim=2)
-        new_cache = inp[:, :, inp.shape[2] - left:]
+        if lookahead_len > 0:
+            # inp ends with [..., pending (C), lookahead (lookahead_len)]; keep
+            # the ``left`` frames ending right before the lookahead region.
+            new_cache = inp[:, :, -(lookahead_len + left) : -lookahead_len]
+        else:
+            new_cache = inp[:, :, inp.shape[2] - left:]
         x = self.depthwise_conv(inp)
         if self.norm_type == "batch_norm":
             x = self.batch_norm(x)
@@ -636,9 +660,18 @@ class ConformerLayer(nn.Module):
         sin: Tensor,
         kv_cache: Optional[Tuple[Tensor, Tensor]],
         conv_cache: Optional[Tensor],
+        lookahead_len: int = 0,
     ) -> Tuple[Tensor, Tuple[Tensor, Tensor], Tensor]:
         """Cache-aware Conformer block for one chunk. Mirrors ``forward`` exactly
-        but threads the attention KV-cache and depthwise-conv cache."""
+        but threads the attention KV-cache and depthwise-conv cache.
+
+        ``lookahead_len`` enables the right-context (defer=1) path: ``x`` then
+        holds two concatenated chunks ``[pending, lookahead]`` whose attention is
+        computed together (the pending chunk's queries see the look-ahead chunk's
+        keys), and the depthwise-conv cache retains the pending chunk's tail. The
+        attention KV cache is returned UN-trimmed (cache + pending + lookahead);
+        the caller drops the look-ahead frames so the persistent cache holds only
+        emitted (left-context) keys."""
         residual = x
         x = self.norm_feed_forward1(x)
         x = self.feed_forward1(x)
@@ -649,7 +682,9 @@ class ConformerLayer(nn.Module):
         residual = residual + x
 
         x = self.norm_conv(residual)
-        x, new_conv = self.conv.forward_streaming(x, conv_cache)
+        x, new_conv = self.conv.forward_streaming(
+            x, conv_cache, lookahead_len=lookahead_len
+        )
         residual = residual + x
 
         x = self.norm_feed_forward2(residual)
@@ -688,18 +723,22 @@ class ConformerEncoder(nn.Module):
         streaming: bool = False,
         chunk_size: int = 8,
         left_context_chunks: int = -1,
+        right_context_chunks: int = 0,
     ):
         super().__init__()
         self.feat_in = feat_in
         self.activation_checkpointing = activation_checkpointing
-        # Streaming turns the encoder into a chunked, limited-right-context model:
-        # causal subsampling/conv + block attention (queries in chunk i see only
-        # chunks <= i). chunk_size is in encoder frames (40 ms each); -1 left
-        # context means unlimited past. Adds no parameters -- only masking and
-        # causal padding change -- so pretrained weights load unchanged.
+        # Streaming turns the encoder into a chunked model: causal subsampling/
+        # conv + block attention. A query in chunk c attends to chunks in
+        # [c - left_context_chunks, c + right_context_chunks]. left=-1 means
+        # unlimited past; right>0 adds lookahead (latency += right chunks). With
+        # right>0 the training target IS the streaming compute graph, so the
+        # model must be (re)trained in streaming mode for usable quality --
+        # chunked inference then matches the trained mask exactly. Adds no params.
         self.streaming = streaming
         self.chunk_size = chunk_size
         self.left_context_chunks = left_context_chunks
+        self.right_context_chunks = right_context_chunks
         if streaming:
             assert self_attention_model == "rotary", (
                 "streaming supports only rotary attention"
@@ -798,15 +837,16 @@ class ConformerEncoder(nn.Module):
         """
         Block (chunk-limited) attention mask in encoder-frame space, using the
         codebase convention True = disallowed. A query in chunk ``c(q)=q//chunk``
-        may attend to a key in chunk ``c(k)`` iff ``c(k) <= c(q)`` and (for a
-        bounded window) ``c(k) >= c(q) - left_context_chunks``. Because the chunk
-        boundary is shared by every layer, the right-context lookahead is exactly
-        one chunk and does not compound with depth.
+        may attend to a key in chunk ``c(k)`` iff ``c(k) <= c(q) + right_context_chunks``
+        (lookahead) and, for a bounded window, ``c(k) >= c(q) - left_context_chunks``.
+        With ``right_context_chunks=0`` this is strictly causal. Note right-context
+        does compound through depth at inference; the model is (re)trained in
+        streaming mode so chunked inference matches this mask.
         """
         idx = torch.arange(seq_len, device=device)
         cq = (idx // self.chunk_size).unsqueeze(1)  # [T, 1]
         ck = (idx // self.chunk_size).unsqueeze(0)  # [1, T]
-        disallow = ck > cq  # future chunks
+        disallow = ck > (cq + self.right_context_chunks)  # beyond lookahead
         if self.left_context_chunks >= 0:
             disallow = disallow | (ck < (cq - self.left_context_chunks))
         return disallow  # [T, T], True = masked
@@ -869,28 +909,9 @@ class ConformerEncoder(nn.Module):
         )
         return StreamingState(len(self.layers), n_subs)
 
-    def forward_streaming_chunk(
-        self, feat_chunk: Tensor, state: StreamingState
-    ) -> Tensor:
-        """
-        Encode one streaming chunk of features, updating ``state`` in place.
-        ``feat_chunk`` is channels-first ``[b, feat_in, t_feat]`` (raw log-mel,
-        e.g. 32 feature frames -> 8 encoder frames at chunk_size=8). Returns the
-        encoded chunk ``[b, d_model, n_enc]``. Concatenating the outputs over all
-        chunks reproduces ``forward`` on the whole utterance (verified by parity
-        test); this is the real-time inference path.
-        """
-        assert self.streaming, "forward_streaming_chunk requires streaming=True"
-        if not hasattr(self.pos_enc, "pe"):
-            self.pos_enc.extend_pe(self.pos_emb_max_len, feat_chunk.device)
-
-        x = self.pre_encode.forward_streaming(feat_chunk, state)  # [b, d, n]
-        x = x.transpose(1, 2)  # [b, n, d]
-        n = x.shape[1]
-        if n == 0:
-            return x.transpose(1, 2)
-
-        j = state.processed
+    def _rotary_for(self, j: int, n: int, device: torch.device) -> Tuple[Tensor, Tensor]:
+        """Cos/sin tables for ``n`` encoder frames starting at absolute position
+        ``j``, growing the rotary buffer when the stream exceeds ``pos_emb_max_len``."""
         pe = self.pos_enc.pe
         half = pe.shape[0] // 2
         # Grow the rotary buffer for streams longer than pos_emb_max_len (default
@@ -898,29 +919,166 @@ class ConformerEncoder(nn.Module):
         # are position-wise, so extending the buffer does not change the values
         # already emitted for earlier positions; it only appends higher indices.
         if j + n > half:
-            self.pos_enc.extend_pe(j + n, feat_chunk.device)
+            self.pos_enc.extend_pe(j + n, device)
             pe = self.pos_enc.pe
             half = pe.shape[0] // 2
-        cos = pe[j : j + n]
-        sin = pe[half + j : half + j + n]
+        return pe[j : j + n], pe[half + j : half + j + n]
+
+    def _evict_left_context(self, state: StreamingState) -> None:
+        """Bound each layer's attention cache to the training left-context window.
+        The next chunk's queries may only see keys at positions >= (j+n) -
+        left_context_chunks*chunk_size, so keep that many trailing frames. With
+        left_context_chunks=-1 (unlimited) keep everything."""
+        if self.left_context_chunks >= 0:
+            keep = self.left_context_chunks * self.chunk_size
+            state.kv = [self._trim_kv(kv, keep) for kv in state.kv]
+
+    def forward_streaming_chunk(
+        self, feat_chunk: Tensor, state: StreamingState
+    ) -> Tensor:
+        """
+        Encode one streaming chunk of features, updating ``state`` in place.
+        ``feat_chunk`` is channels-first ``[b, feat_in, t_feat]`` (raw log-mel,
+        e.g. 32 feature frames -> 8 encoder frames at chunk_size=8). Returns the
+        encoded chunk ``[b, d_model, n_enc]``.
+
+        With ``right_context_chunks == 0`` (strictly causal) each chunk is emitted
+        immediately and concatenating outputs reproduces ``forward`` exactly
+        (verified by parity test).
+
+        With ``right_context_chunks > 0`` (look-ahead; only ``=1`` is implemented)
+        emission is deferred by one chunk: a query in chunk ``c`` must attend to
+        keys in chunk ``c+1``. The most recently subsampled chunk is held in
+        ``state.pending_feat``; the next call pairs it with the fresh chunk so the
+        pending chunk's queries see the fresh chunk's keys, and the pending chunk
+        is then emitted. The first call therefore emits nothing (it only buffers),
+        and the final pending chunk is drained by :meth:`flush_streaming`. Per-call
+        cost is O(chunk_size * n_layers) -- constant, independent of prefix length.
+        """
+        assert self.streaming, "forward_streaming_chunk requires streaming=True"
+        if not hasattr(self.pos_enc, "pe"):
+            self.pos_enc.extend_pe(self.pos_emb_max_len, feat_chunk.device)
+
+        if self.right_context_chunks == 0:
+            return self._forward_streaming_chunk_causal(feat_chunk, state)
+        return self._forward_streaming_chunk_defer(feat_chunk, state)
+
+    def _forward_streaming_chunk_causal(
+        self, feat_chunk: Tensor, state: StreamingState
+    ) -> Tensor:
+        """Strictly-causal (right_context_chunks=0) streaming path. Each chunk is
+        emitted immediately; concatenating outputs reproduces ``forward``."""
+        x = self.pre_encode.forward_streaming(feat_chunk, state)  # [b, d, n]
+        x = x.transpose(1, 2)  # [b, n, d]
+        n = x.shape[1]
+        if n == 0:
+            return x.transpose(1, 2)
+
+        j = state.processed
+        cos, sin = self._rotary_for(j, n, feat_chunk.device)
 
         for i, layer in enumerate(self.layers):
             x, state.kv[i], state.conv[i] = layer.forward_streaming(
                 x, cos, sin, state.kv[i], state.conv[i]
             )
-        # Bound the attention cache to the training left-context window. Each
-        # layer's kv[i] now holds every key/value this chunk attended to -- the
-        # previous cache plus this chunk's new frames (positions [j, j+n)). The
-        # next chunk's queries start at j+n and, under the block mask, may only
-        # see keys at positions >= (j+n) - left_context_chunks*chunk_size, so
-        # keep exactly that many trailing frames and drop the rest. With
-        # left_context_chunks=-1 (unlimited) we keep everything, which is what
-        # reproduces the unbounded training mask.
-        if self.left_context_chunks >= 0:
-            keep = self.left_context_chunks * self.chunk_size
-            state.kv = [self._trim_kv(kv, keep) for kv in state.kv]
+        self._evict_left_context(state)
         state.processed += n
         return x.transpose(1, 2)  # [b, d, n]
+
+    def _forward_streaming_chunk_defer(
+        self, feat_chunk: Tensor, state: StreamingState
+    ) -> Tensor:
+        """Right-context (defer=1) streaming path.
+
+        Subsample the new chunk only (the causal subsampling cache advances by
+        exactly this chunk -- no overlap, no double-count). If a pending chunk is
+        buffered, run the whole layer stack over ``[pending, new]`` so the pending
+        chunk's queries attend to the new chunk's keys (the 1-chunk look-ahead),
+        then emit the pending chunk and keep the new chunk as the next pending.
+        The attention KV cache holds only EMITTED (left-context) keys: the new
+        chunk's keys are used transiently and then trimmed off; the depthwise-conv
+        cache retains the pending chunk's tail (see ``lookahead_len``). All work is
+        over two chunks, so cost is O(chunk_size * n_layers), independent of prefix.
+
+        Right-context lookahead compounds through depth at inference (layer ``i``'s
+        look-ahead keys already carry the look-ahead baked in by layers ``< i``);
+        a model is (re)trained against this streaming mask so chunked inference
+        matches the trained result. At a single layer there is no compounding, so
+        this path reproduces ``forward`` exactly (verified at n_layers=1)."""
+        s_new = self.pre_encode.forward_streaming(feat_chunk, state)  # [b, d, n_new]
+        s_new = s_new.transpose(1, 2)  # [b, n_new, d]
+        n_new = s_new.shape[1]
+        if n_new == 0:
+            return s_new.transpose(1, 2)  # nothing subsampled; emit nothing
+
+        if state.pending_feat is None:
+            # First chunk: no look-ahead available yet. Buffer it and emit nothing.
+            state.pending_feat = s_new
+            return s_new.new_zeros(s_new.shape[0], s_new.shape[2], 0)
+
+        s_pend = state.pending_feat  # [b, n_pend, d]
+        n_pend = s_pend.shape[1]
+        x = torch.cat([s_pend, s_new], dim=1)  # [b, n_pend + n_new, d]
+        j = state.processed  # absolute offset of the pending chunk
+        cos, sin = self._rotary_for(j, n_pend + n_new, feat_chunk.device)
+
+        for i, layer in enumerate(self.layers):
+            x, full_kv, new_conv = layer.forward_streaming(
+                x, cos, sin, state.kv[i], state.conv[i], lookahead_len=n_new
+            )
+            # The attention appended BOTH chunks' keys to the cache. Drop the new
+            # (look-ahead) chunk's keys so only emitted left-context persists; the
+            # new chunk is fed fresh next call (as the pending half).
+            state.kv[i] = self._drop_lookahead_kv(full_kv, n_new)
+            state.conv[i] = new_conv
+
+        self._evict_left_context(state)
+        out_pend = x[:, :n_pend, :]  # emit the (now look-ahead-complete) chunk
+        state.processed += n_pend
+        state.pending_feat = s_new  # the fresh chunk awaits its own look-ahead
+        return out_pend.transpose(1, 2)  # [b, d, n_pend]
+
+    @staticmethod
+    def _drop_lookahead_kv(
+        kv: Optional[Tuple[Tensor, Tensor]], lookahead_len: int
+    ) -> Optional[Tuple[Tensor, Tensor]]:
+        """Drop the last ``lookahead_len`` time-frames of a cached (k, v) pair
+        (dim 2), so the persistent cache holds only emitted left-context keys."""
+        if kv is None or lookahead_len == 0:
+            return kv
+        k, v = kv
+        keep = k.size(2) - lookahead_len
+        return (k[:, :, :keep, :], v[:, :, :keep, :])
+
+    def flush_streaming(self, state: StreamingState) -> Tensor:
+        """
+        Drain the final buffered chunk at end of stream and return its encoding
+        ``[b, d_model, n]``. With ``right_context_chunks == 0`` nothing is ever
+        buffered, so this returns an empty tensor. With ``right_context_chunks >
+        0`` the last pending chunk has no real look-ahead (the stream ended), so it
+        is run alone -- exactly matching the training mask, whose look-ahead chunk
+        for the final query chunk simply does not exist. Safe to call once per
+        stream after the last :meth:`forward_streaming_chunk`; idempotent
+        (clears ``pending_feat``).
+        """
+        if self.right_context_chunks == 0 or state.pending_feat is None:
+            state.pending_feat = None
+            d = self.layers[0].norm_out.normalized_shape[0]
+            return torch.zeros(0, d, 0)
+
+        s_pend = state.pending_feat  # [b, n_pend, d]
+        n_pend = s_pend.shape[1]
+        j = state.processed
+        cos, sin = self._rotary_for(j, n_pend, s_pend.device)
+        x = s_pend
+        for i, layer in enumerate(self.layers):
+            x, state.kv[i], state.conv[i] = layer.forward_streaming(
+                x, cos, sin, state.kv[i], state.conv[i]
+            )
+        self._evict_left_context(state)
+        state.processed += n_pend
+        state.pending_feat = None
+        return x.transpose(1, 2)  # [b, d, n_pend]
 
     @staticmethod
     def _trim_kv(

@@ -67,11 +67,15 @@ def _streaming_meta_from_hp(hp: dict) -> "Optional[dict]":
     """
     if not hp.get("streaming"):
         return None
+    chunk = hp.get("chunk_size", 8)
+    rc = hp.get("right_context_chunks", 0)
     return {
         "enabled": True,
-        "chunk_size": hp.get("chunk_size", 8),
+        "chunk_size": chunk,
         "left_context_chunks": hp.get("left_context_chunks", -1),
-        "latency_ms": hp.get("chunk_size", 8) * 40,
+        "right_context_chunks": rc,
+        # latency = the chunk itself + right-context lookahead (1-chunk defer).
+        "latency_ms": (chunk + chunk * rc) * 40,
         "note": (
             "Cache-aware chunked Conformer (causal convs/subsampling + block "
             "attention). Reconstructed at load by gigaam.load_model_from_hf / "

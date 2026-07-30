@@ -177,6 +177,7 @@ def load_model_from_hf(
             model,
             chunk_size=streaming_meta.get("chunk_size", 8),
             left_context_chunks=streaming_meta.get("left_context_chunks", -1),
+            right_context_chunks=streaming_meta.get("right_context_chunks", 0),
         )
 
     cfg.model_name = resolved_name

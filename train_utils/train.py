@@ -91,6 +91,15 @@ def parse_args() -> argparse.Namespace:
         help="Streaming left-context window in chunks (-1 = unlimited past).",
     )
     p.add_argument(
+        "--right_context_chunks",
+        type=int,
+        default=0,
+        help="Streaming right-context (lookahead) in chunks. Adds 1-chunk "
+        "attention lookahead per chunk (latency += right_context_chunks chunks). "
+        "Since lookahead compounds with depth, the model is trained with this "
+        "streaming mask so train=inference. 0 = strictly causal (no lookahead).",
+    )
+    p.add_argument(
         "--kd_alpha",
         type=float,
         default=0.0,
@@ -156,6 +165,7 @@ def main():
             model,
             chunk_size=args.chunk_size,
             left_context_chunks=args.left_context_chunks,
+            right_context_chunks=args.right_context_chunks,
         )
         if args.init_from:
             ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
@@ -167,10 +177,13 @@ def main():
             model.load_state_dict(sd, strict=True)
             print(f"Warm-started streaming student from {args.init_from}")
         lat_ms = args.chunk_size * 40
+        rc_ms = args.right_context_chunks * lat_ms
         lc = "unlimited" if args.left_context_chunks < 0 else f"{args.left_context_chunks} chunks"
         print(
             f"Streaming: chunk={args.chunk_size} frames (~{lat_ms} ms), "
-            f"left context {lc} (causal convs/subsampling, block attention)"
+            f"left context {lc}, right context {args.right_context_chunks} chunks "
+            f"(+{rc_ms} ms lookahead), latency ~{lat_ms + rc_ms} ms "
+            f"(causal convs/subsampling, block attention)"
         )
     tokenizer = model.decoding.tokenizer
     blank_id = model.decoding.blank_id

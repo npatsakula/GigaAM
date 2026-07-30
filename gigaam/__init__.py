@@ -188,6 +188,7 @@ def load_model(
                 model,
                 chunk_size=hp.get("chunk_size", 8),
                 left_context_chunks=hp.get("left_context_chunks", -1),
+                right_context_chunks=hp.get("right_context_chunks", 0),
             )
         return model
 

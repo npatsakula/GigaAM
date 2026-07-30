@@ -15,15 +15,21 @@ LONGFORM_THRESHOLD = 25 * SAMPLE_RATE
 
 
 def enable_streaming(
-    model: "GigaAM", chunk_size: int = 8, left_context_chunks: int = -1
+    model: "GigaAM",
+    chunk_size: int = 8,
+    left_context_chunks: int = -1,
+    right_context_chunks: int = 0,
 ) -> "GigaAM":
     """
     Rebuild ``model.encoder`` in streaming mode (chunked block attention + causal
     subsampling/convs) in place, preserving weights. Streaming adds no parameters,
     so the existing encoder state_dict loads strict. ``chunk_size`` is in encoder
     frames (40 ms each; 8 = 320 ms latency); ``left_context_chunks=-1`` means
-    unlimited past. Also records the config on ``model.cfg.encoder`` so it round-
-    trips through checkpoints.
+    unlimited past. ``right_context_chunks>0`` adds 1-chunk lookahead attention
+    (latency += ``right_context_chunks`` chunks); since lookahead compounds with
+    depth the model must be (re)trained in streaming mode for usable quality.
+    Records the config on ``model.cfg.encoder`` so it round-trips through
+    checkpoints.
 
     Order matters with FP8 quantization: this rebuilds the encoder fresh from
     ``cfg.encoder`` (plain ``nn.Linear``), so it must run *before*
@@ -57,6 +63,7 @@ def enable_streaming(
     cfg.encoder.streaming = True
     cfg.encoder.chunk_size = chunk_size
     cfg.encoder.left_context_chunks = left_context_chunks
+    cfg.encoder.right_context_chunks = right_context_chunks
     device = next(model.encoder.parameters()).device
     dtype = next(model.encoder.parameters()).dtype
     old_sd = model.encoder.state_dict()
@@ -266,6 +273,26 @@ class GigaAMASR(GigaAM):
             ids.extend(new_ids)
             frames.extend(new_fr)
             enc_frame += enc_chunk.shape[-1]
+
+        # Drain any final buffered chunk. With right_context_chunks>0 the encoder
+        # defers emission by one chunk, so the last chunk is held until flush; with
+        # right_context_chunks==0 flush is a no-op (returns an empty chunk). Empty
+        # chunks decode to nothing (the CTC/RNN-T chunk decoders skip zero-length).
+        with encoder_ctx:
+            enc_chunk = self.encoder.flush_streaming(state)
+        enc_chunk = enc_chunk.to(head_dtype)
+        if enc_chunk.shape[-1] > 0:
+            if is_ctc:
+                log_probs = self.head(encoder_output=enc_chunk)
+                new_ids, new_fr, last_label = self.decoding.decode_chunk(
+                    log_probs, last_label, enc_frame
+                )
+            else:  # is_rnnt
+                new_ids, new_fr, dec_state, last_label = self.decoding.decode_chunk(
+                    self.head, enc_chunk, dec_state, last_label, enc_frame
+                )
+            ids.extend(new_ids)
+            frames.extend(new_fr)
 
         text = self.decoding.tokenizer.decode(ids)
         return TranscriptionResult(text=text, words=None)

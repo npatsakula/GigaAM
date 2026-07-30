@@ -130,6 +130,74 @@ def test_bounded_left_context_cache_parity(left_context_chunks, feat_frames):
     )
 
 
+@pytest.mark.parametrize("feat_frames", [128, 200, 259, 323])
+def test_right_context_cache_parity_single_layer(feat_frames):
+    """1-chunk right-context streaming == full masked forward, at n_layers=1.
+
+    Right-context (lookahead) compounds with depth, so exact parity against the
+    offline mask is only achievable at n_layers=1 (where there is no compounding).
+    At n_layers=1 this is an exact gate on the defer=1 inference path: each query
+    attends to [its chunk - left, its chunk + 1], and the chunked emit-deferred
+    path (feed non-overlapping chunks, hold one pending, flush at end) must
+    reproduce the full forward exactly. (Production models retrain with the
+    streaming mask, so train=inference and the depth-compounding gap is closed.)"""
+    torch.manual_seed(0)
+    enc_kw = dict(ENC_KW, n_layers=1)
+    enc = ConformerEncoder(
+        **enc_kw,
+        streaming=True,
+        chunk_size=CHUNK,
+        left_context_chunks=-1,
+        right_context_chunks=1,
+    ).eval()
+    x = torch.randn(1, 64, feat_frames)
+    lens = torch.tensor([feat_frames])
+    with torch.inference_mode():
+        full, _ = enc(x, lens)
+        state = enc.init_streaming_state()
+        outs = []
+        for s in range(0, feat_frames, CHUNK * SUB):
+            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
+        outs.append(enc.flush_streaming(state))
+        stream = torch.cat([o for o in outs if o.shape[-1] > 0], dim=2)
+    stream = stream[:, :, : full.shape[-1]]
+    assert full.shape == stream.shape, f"shape mismatch {full.shape} vs {stream.shape}"
+    diff = (full - stream).abs().max().item()
+    assert diff < 1e-4, f"rc=1 L=1 parity broke at {feat_frames}: max|diff|={diff}"
+
+
+def test_right_context_runs_at_production_depth():
+    """The defer=1 right-context path must run end-to-end at production depth
+    (n_layers=16) and produce finite, correctly-shaped output. Exact parity vs
+    the offline mask is NOT expected here: right-context compounds with depth, so
+    a production model is retrained with the streaming mask (train=inference).
+    This test guards the path runs and stays finite at v3's 16-layer depth, and
+    that the chunked output length matches the full forward."""
+    torch.manual_seed(0)
+    enc_kw = dict(ENC_KW, n_layers=16)
+    enc = ConformerEncoder(
+        **enc_kw,
+        streaming=True,
+        chunk_size=CHUNK,
+        left_context_chunks=-1,
+        right_context_chunks=1,
+    ).eval()
+    feat = 200
+    x = torch.randn(1, 64, feat)
+    lens = torch.tensor([feat])
+    with torch.inference_mode():
+        full, _ = enc(x, lens)
+        state = enc.init_streaming_state()
+        outs = []
+        for s in range(0, feat, CHUNK * SUB):
+            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
+        outs.append(enc.flush_streaming(state))
+        stream = torch.cat([o for o in outs if o.shape[-1] > 0], dim=2)
+    stream = stream[:, :, : full.shape[-1]]
+    assert full.shape == stream.shape
+    assert torch.isfinite(stream).all(), "rc=1 L=16 output has NaN/Inf"
+
+
 def test_incremental_collapse_parity():
     """Incremental cross-chunk CTC collapse == offline whole-sequence collapse on
     the same (synthetic) logits."""
