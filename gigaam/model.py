@@ -261,6 +261,12 @@ class GigaAMASR(GigaAM):
             with encoder_ctx:
                 enc_chunk = self.encoder.forward_streaming_chunk(fc, state)
             enc_chunk = enc_chunk.to(head_dtype)
+            # With right_context_chunks>0 the encoder defers emission by one chunk,
+            # so the final iteration may return 0 frames (the last chunk is flushed
+            # after the loop). Skip the head/decode for zero-length chunks -- they
+            # produce no tokens and would crash the Conv1d head on a 0-size input.
+            if enc_chunk.shape[-1] == 0:
+                continue
             if is_ctc:
                 log_probs = self.head(encoder_output=enc_chunk)  # [1, n, C]
                 new_ids, new_fr, last_label = self.decoding.decode_chunk(
