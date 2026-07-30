@@ -197,25 +197,29 @@ class GigaAMASR(GigaAM):
     @torch.inference_mode()
     def transcribe_streaming(self, wav_file: str) -> TranscriptionResult:
         """
-        Cache-aware streaming transcription (CTC models only). Encodes the audio
-        chunk-by-chunk through the streaming encoder -- reproducing the offline
-        result within numerical tolerance -- and collapses CTC output incrementally
-        across chunk boundaries. Requires a model loaded/fine-tuned in streaming
-        mode (``encoder.streaming``); see ``gigaam.enable_streaming``.
+        Cache-aware streaming transcription (CTC and RNN-T models). Encodes the
+        audio chunk-by-chunk through the streaming encoder -- reproducing the
+        offline result within numerical tolerance -- and decodes incrementally
+        across chunk boundaries: CTC collapse for CTC models, a stateful
+        predictor+joint loop for RNN-T models (the predictor LSTM state and last
+        label thread across chunks). Requires a model loaded/fine-tuned in
+        streaming mode (``encoder.streaming``); see ``gigaam.enable_streaming``.
 
         This reference driver preprocesses the whole file, then feeds fixed
         feature blocks to emulate real-time arrival; a live driver would push
         audio as it comes and keep a one-hop overlap for the ``center=False``
         window. Output is identical either way.
         """
-        from .decoding import CTCGreedyDecoding
+        from .decoding import CTCGreedyDecoding, RNNTGreedyDecoding
 
         assert getattr(self.encoder, "streaming", False), (
             "model is not in streaming mode; load a streaming fine-tune or call "
             "gigaam.enable_streaming(model)"
         )
-        assert isinstance(self.decoding, CTCGreedyDecoding), (
-            "transcribe_streaming supports CTC models only"
+        is_ctc = isinstance(self.decoding, CTCGreedyDecoding)
+        is_rnnt = isinstance(self.decoding, RNNTGreedyDecoding)
+        assert is_ctc or is_rnnt, (
+            "transcribe_streaming supports CTC and RNN-T models only"
         )
 
         wav, length = self.prepare_wav(wav_file)
@@ -232,6 +236,9 @@ class GigaAMASR(GigaAM):
         ids: List[int] = []
         frames: List[int] = []
         last_label = self.decoding.blank_id
+        # RNN-T only: the predictor LSTM (h, c) carried across chunks. None on
+        # the first chunk so decode_chunk makes the fresh (blank-seeded) prediction.
+        dec_state = None
         enc_frame = 0
         # Mirror forward(): on GPU run the encoder under fp16 autocast (the encoder
         # params are pre-halved when fp16_encoder=True, but the autocast context
@@ -246,10 +253,16 @@ class GigaAMASR(GigaAM):
             fc = features[:, :, s : s + feat_per_chunk]
             with encoder_ctx:
                 enc_chunk = self.encoder.forward_streaming_chunk(fc, state)
-            log_probs = self.head(encoder_output=enc_chunk.to(head_dtype))  # [1, n, C]
-            new_ids, new_fr, last_label = self.decoding.decode_chunk(
-                log_probs, last_label, enc_frame
-            )
+            enc_chunk = enc_chunk.to(head_dtype)
+            if is_ctc:
+                log_probs = self.head(encoder_output=enc_chunk)  # [1, n, C]
+                new_ids, new_fr, last_label = self.decoding.decode_chunk(
+                    log_probs, last_label, enc_frame
+                )
+            else:  # is_rnnt
+                new_ids, new_fr, dec_state, last_label = self.decoding.decode_chunk(
+                    self.head, enc_chunk, dec_state, last_label, enc_frame
+                )
             ids.extend(new_ids)
             frames.extend(new_fr)
             enc_frame += enc_chunk.shape[-1]

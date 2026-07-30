@@ -181,6 +181,66 @@ def test_real_model_streaming_parity():
     assert full == stream, f"driver text parity: {full!r} != {stream!r}"
 
 
+@pytest.mark.parametrize("T", [37, 64, 65])
+def test_rnnt_decode_chunk_parity(T):
+    """Chunk-by-chunk RNN-T greedy decode == offline whole-sequence decode, at
+    chunk-aligned and non-multiple lengths. Isolates decode correctness (predictor
+    state + last label carried across chunk boundaries) from the encoder."""
+    from gigaam.decoder import RNNTHead
+    from gigaam.decoding import RNNTGreedyDecoding
+
+    D = 16
+    head = RNNTHead(
+        decoder={"pred_hidden": D, "pred_rnn_layers": 1, "num_classes": 8},
+        joint={"enc_hidden": D, "pred_hidden": D, "joint_hidden": D, "num_classes": 8},
+    ).eval()
+    dec = RNNTGreedyDecoding(vocabulary=[chr(97 + i) for i in range(7)])  # blank=7
+
+    torch.manual_seed(0)
+    encoded = torch.randn(1, D, T)  # channels-first [1, D, T]
+    enc_len = torch.tensor([T])
+
+    with torch.inference_mode():
+        ref_ids = dec.decode(head, encoded, enc_len)[0][1]
+
+        ids, dec_state, last_label = [], None, dec.blank_id
+        for off in range(0, T, CHUNK):
+            chunk = encoded[:, :, off : off + CHUNK]
+            new_ids, _, dec_state, last_label = dec.decode_chunk(
+                head, chunk, dec_state, last_label, off
+            )
+            ids.extend(new_ids)
+
+    assert ids == ref_ids, f"RNN-T decode parity broke: {ids[:10]} != {ref_ids[:10]}"
+
+
+@pytest.mark.parametrize("revision", ["v3_rnnt", "v3_e2e_rnnt"])
+@pytest.mark.partial
+def test_real_model_rnnt_streaming_parity(revision):
+    """End-to-end: on real RNN-T weights patched into streaming mode, the
+    chunk-by-chunk driver reproduces the streaming-masked forward's text. Covers
+    v3_e2e_rnnt (punctuation/normalization) with the same code path for free."""
+    import gigaam
+
+    model = gigaam.load_model(revision, device="cpu", fp16_encoder=False).eval()
+    gigaam.enable_streaming(model, chunk_size=CHUNK, left_context_chunks=-1)
+
+    import numpy as np
+    import soundfile as sf
+    import tempfile
+
+    sr = 16000
+    t = np.linspace(0, 4.0, sr * 4, dtype=np.float32)
+    audio = (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        sf.write(f.name, audio, sr)
+        path = f.name
+
+    full = model.transcribe(path).text
+    stream = model.transcribe_streaming(path).text
+    assert full == stream, f"[{revision}] driver text parity: {full!r} != {stream!r}"
+
+
 def test_enable_streaming_refuses_fp8_encoder():
     """enable_streaming rebuilds the encoder fresh (plain nn.Linear), so it must
     run BEFORE FP8 quantization. Calling it on an already-quantized encoder would
