@@ -27,6 +27,14 @@ def wer(ref: str, hyp: str) -> tuple[int, int]:
     return editdistance.eval(r, hyp.split()), max(len(r), 1)
 
 
+def cer(ref: str, hyp: str) -> tuple[int, int]:
+    """Character error rate. editdistance over the raw strings (no split): the
+    edit distance between two strings IS the character-level distance. The
+    reference length is the character count (excluding the trailing newline)."""
+    r = ref.rstrip("\n")
+    return editdistance.eval(r, hyp.rstrip("\n")), max(len(r), 1)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -75,6 +83,7 @@ def main() -> None:
         rows = rows[: args.limit]
 
     gap_e = gap_w = abs_e = abs_w = 0
+    gap_cer_e = gap_cer_n = abs_cer_e = abs_cer_n = 0
     audio_s = infer_s = 0.0
     for i, row in enumerate(rows):
         pth = Path(row["path"])
@@ -88,17 +97,29 @@ def main() -> None:
         e, w = wer(ref_off, hyp)
         gap_e += e
         gap_w += w
+        ce, cn = cer(ref_off, hyp)
+        gap_cer_e += ce
+        gap_cer_n += cn
         if "transcription" in row and row["transcription"]:
             e2, w2 = wer(row["transcription"].lower(), hyp)
             abs_e += e2
             abs_w += w2
+            ce2, cn2 = cer(row["transcription"].lower(), hyp)
+            abs_cer_e += ce2
+            abs_cer_n += cn2
         if i < 5:
             print(f"OFF: {ref_off}\nSTR: {hyp}\n")
 
     print(f"n={len(rows)}")
-    print(f"RESTORATION GAP (streaming vs offline WER): {100*gap_e/max(gap_w,1):.2f}%")
+    print(
+        f"RESTORATION GAP (streaming vs offline) WER: {100*gap_e/max(gap_w,1):.2f}%   "
+        f"CER: {100*gap_cer_e/max(gap_cer_n,1):.2f}%"
+    )
     if abs_w:
-        print(f"absolute WER vs dataset:                    {100*abs_e/max(abs_w,1):.2f}%")
+        print(
+            f"absolute vs dataset                         WER: {100*abs_e/max(abs_w,1):.2f}%   "
+            f"CER: {100*abs_cer_e/max(abs_cer_n,1):.2f}%"
+        )
     print(f"RTF (streaming compute / audio):            {infer_s/max(audio_s,1e-9):.3f}")
 
 
