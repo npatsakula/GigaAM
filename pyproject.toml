@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "GigaAM: A package for audio modeling and ASR."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 authors = [
     { name = "GigaChat Team" },
 ]
@@ -25,24 +25,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Why torch is optional: often preinstalled and reinstall is slow.
-# Older builds also work, pinned extras are recommended.
+# Why torch is optional: often preinstalled and reinstall is slow. One pin for
+# every extra; on Linux it resolves from the PyTorch CUDA 13.0 index (see
+# [tool.uv.sources]), elsewhere from PyPI (CPU / MPS builds).
 torch = [
-    "torch>=2.6",
-    "torchaudio>=2.6",
+    "torch==2.14.1",
+    "torchaudio==2.11.0",
+    "torchcodec>=0.17",
 ]
 longform = [
+    "gigaam[torch]",
     "numba>=0.62",
     "pyannote.audio==4.0.*",
     "pyarrow>=23",
-    "torch==2.10.*",
-    "torchaudio==2.10.*",
-    "torchcodec==0.10",
     "transformers==5.*",
 ]
 train = [
+    "gigaam[torch]",
     "editdistance",
+    "huggingface-hub",
     "lightning>=2.6",
+    "pyarrow>=15",
     "tensorboard>=2.20",
     "wandb>=0.25",
 ]
@@ -69,6 +72,26 @@ Homepage = "https://github.com/salute-developers/GigaAM/"
 
 [tool.setuptools.packages.find]
 include = ["gigaam"]
+
+# uv project configuration: `uv sync --extra torch --extra train` builds .venv
+# from this file + uv.lock. Linux (the H100 box) takes torch/torchaudio/
+# torchcodec from the CUDA 13.0 wheel index; macOS/Windows from PyPI.
+[tool.uv]
+# Keep the lock cross-platform but only for the interpreters we support.
+environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'darwin'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+torchcodec = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
 
 [tool.pytest.ini_options]
 markers = [

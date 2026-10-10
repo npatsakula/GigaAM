@@ -45,6 +45,14 @@ pip install -e ".[tests]"
 pytest -v tests/test_loading.py -m partial  # or `-m full` to test all models
 ```
 
+The repository is also a [uv](https://docs.astral.sh/uv/) project. `uv sync` builds `.venv` from `pyproject.toml` and the committed `uv.lock` (PyTorch 2.14.1; the CUDA 13.0 wheels on Linux, CPU/MPS builds elsewhere):
+
+```bash
+uv sync --extra torch                      # library only
+uv sync --extra torch --extra train --extra tests   # fine-tuning + tests
+uv run pytest -v tests/test_loading.py -m partial
+```
+
 ---
 
 ## GigaAM overview

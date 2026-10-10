@@ -36,7 +36,9 @@ WORKERS="${WORKERS:-16}"
 COMPILE_BACKEND="${COMPILE_BACKEND:-inductor}"
 LEFT_CONTEXT="${LEFT_CONTEXT:-16}"
 ACCELERATOR="${ACCELERATOR:-auto}"
-PY="${PYTHON:-python}"
+# Every stage runs through the project environment (uv.lock); override with
+# PYTHON=/path/to/python to use an existing interpreter instead.
+PY="${PYTHON:-uv run --frozen python}"
 
 if [[ "${SMOKE:-0}" == "1" ]]; then
   DATA_DIR="${DATA_DIR}_smoke"

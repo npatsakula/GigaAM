@@ -125,11 +125,12 @@ python train.py \
 A base model patched into streaming mode (`gigaam.enable_streaming`) runs correctly but transcribes poorly: its weights never saw causal convolutions, chunked attention or a bounded context window. Streaming quality comes from a fine-tune in streaming mode that distills the offline model into the streaming one. The whole recipe for one H100 is scripted:
 
 ```bash
-bash train_utils/streaming/setup_h100.sh        # uv venv, PyTorch 2.14.1 (CUDA 13.0), train extras
-source .venv-h100/bin/activate
+bash train_utils/streaming/setup_h100.sh        # uv sync from pyproject/uv.lock + GPU self-check
 SMOKE=1 bash train_utils/streaming/run_pipeline.sh   # ~10 min end-to-end check on a tiny subset
 bash train_utils/streaming/run_pipeline.sh           # full run; see the header for the knobs
 ```
+
+The repository is a [uv](https://docs.astral.sh/uv/) project: `pyproject.toml` pins PyTorch 2.14.1 and routes `torch`/`torchaudio`/`torchcodec` to the CUDA 13.0 wheel index on Linux (PyPI builds elsewhere), and `uv.lock` freezes every transitive version. `uv sync --extra torch --extra train` builds `.venv` from that configuration on any machine; every pipeline stage runs through `uv run`.
 
 The pipeline has four stages, selectable with `STAGES="data pseudo train eval"`:
 
