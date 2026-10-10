@@ -153,7 +153,21 @@ print(model.transcribe_streaming(audio_path, word_timestamps=True))
 * `left_context_chunks` bounds the attention window into the past (16 chunks = 5.1 s). It bounds the per-chunk cost and the cache, so a session can run indefinitely. `-1` (unlimited) makes cost and memory grow with the stream.
 * `right_context_chunks=1` lets every chunk attend to one chunk of look-ahead (Emformer-style hard copy); latency doubles. The training forward is exactly the chunked inference computation, so there is no train/inference mismatch at any depth.
 * A base model patched with `enable_streaming` streams correctly but with reduced accuracy, because its weights never saw causal convolutions or chunked attention. Fine-tune in streaming mode for production quality: `train_utils/train.py --streaming --chunk_size 8 --left_context_chunks 16 [--right_context_chunks 1] [--kd_alpha 0.5]` distills the offline model into the streaming one; the checkpoint then restores streaming mode on `load_model`. `train_utils/eval_streaming.py` reports the streaming-vs-offline gap and real-time factor.
-* Sessions are single-stream (batch size 1); run one session per stream. FP8 quantization composes with streaming (`enable_streaming` first, then `gigaam.fp8.quantize_model`).
+* Many concurrent streams: `gigaam.StreamingBatch` serves any number of sessions with one batched encoder call (and one batched RNN-T decoder call) per chunk round. Sessions created through it only buffer on `push`; `batch.step()` encodes every session that has a full chunk ready. Streams may join at any time, have different histories and leave via `finish()`; each result is identical to the same audio through a lone session. `model.transcribe_streaming_batch(paths)` does this for a list of files.
+
+```python
+batch = gigaam.StreamingBatch(model, word_timestamps=True)
+sessions = {client_id: batch.new_session() for client_id in clients}
+while clients_active():
+    for client_id, pcm in receive_audio():      # whatever arrived since the last round
+        sessions[client_id].push(pcm)
+    batch.step()                                # one encoder call for every ready chunk
+    for client_id, s in sessions.items():
+        send_partial(client_id, s.text)
+final = sessions[client_id].finish()            # when a client hangs up
+```
+
+* FP8 quantization composes with streaming (`enable_streaming` first, then `gigaam.fp8.quantize_model`).
 
 ### Model Fine-tuning
 

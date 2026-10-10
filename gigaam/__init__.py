@@ -10,13 +10,14 @@ from tqdm import tqdm
 
 from .model import GigaAM, GigaAMASR, GigaAMEmo, enable_streaming
 from .preprocess import load_audio
-from .streaming import StreamingSession
+from .streaming import StreamingBatch, StreamingSession
 from .utils import format_time
 
 __all__ = [
     "GigaAM",
     "GigaAMASR",
     "GigaAMEmo",
+    "StreamingBatch",
     "StreamingSession",
     "enable_streaming",
     "load_audio",

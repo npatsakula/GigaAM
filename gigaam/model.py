@@ -236,6 +236,41 @@ class GigaAMASR(GigaAM):
             session.push(wav[s : s + step])
         return session.finish()
 
+    @torch.inference_mode()
+    def transcribe_streaming_batch(
+        self,
+        wav_files: List[str],
+        word_timestamps: bool = False,
+        push_seconds: float = 0.1,
+        max_batch_size: int = 64,
+    ) -> List[TranscriptionResult]:
+        """
+        Transcribe several files through the live streaming path at once: every
+        file is a :class:`gigaam.streaming.StreamingSession` in one
+        :class:`gigaam.streaming.StreamingBatch`; audio is pushed in
+        ``push_seconds`` pieces in lockstep and the batch steps after every
+        round, so each chunk round is one batched encoder call. Each result
+        equals :meth:`transcribe_streaming` on that file alone.
+        """
+        from .streaming import StreamingBatch
+
+        batch = StreamingBatch(
+            self, word_timestamps=word_timestamps, max_batch_size=max_batch_size
+        )
+        wavs = [load_audio(f) for f in wav_files]
+        sessions = [batch.new_session() for _ in wavs]
+        step = max(1, int(push_seconds * SAMPLE_RATE))
+        longest = max((w.numel() for w in wavs), default=0)
+        for s0 in range(0, longest, step):
+            for wav, session in zip(wavs, sessions):
+                if s0 < wav.numel():
+                    session.push(wav[s0 : s0 + step])
+            batch.step()
+            for wav, session in zip(wavs, sessions):
+                if s0 + step >= wav.numel() and not session.finished:
+                    session.finish()
+        return [s.finish() for s in sessions]
+
     def forward_for_export(
         self, features: Tensor, feature_lengths: Tensor
     ) -> Tuple[Tensor, Tensor]:

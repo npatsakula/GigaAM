@@ -152,7 +152,21 @@ print(model.transcribe_streaming(audio_path, word_timestamps=True))
 * `left_context_chunks` ограничивает окно внимания в прошлое (16 чанков = 5.1 с), а значит и стоимость чанка, и размер кэша: сессия может работать неограниченно долго. `-1` (без ограничения) заставляет стоимость и память расти с длиной потока.
 * `right_context_chunks=1` даёт каждому чанку один чанк заглядывания вперёд (жёсткая копия в стиле Emformer); задержка удваивается. Обучающий проход в точности совпадает с чанковым инференсом на любой глубине, рассогласования train/inference нет.
 * Базовая модель после `enable_streaming` работает потоково, но с худшим качеством: её веса не видели каузальных свёрток и блочного внимания. Для продакшена дообучите модель в потоковом режиме: `train_utils/train.py --streaming --chunk_size 8 --left_context_chunks 16 [--right_context_chunks 1] [--kd_alpha 0.5]` дистиллирует офлайн-модель в потоковую; чекпоинт восстанавливает потоковый режим при `load_model`. `train_utils/eval_streaming.py` считает разрыв между потоковой и офлайн-моделью и RTF.
-* Сессия обрабатывает один поток (batch size 1); на каждый поток создавайте свою сессию. FP8-квантование совместимо с потоковым режимом (сначала `enable_streaming`, затем `gigaam.fp8.quantize_model`).
+* Много потоков одновременно: `gigaam.StreamingBatch` обслуживает любое число сессий одним батчевым вызовом энкодера (и одним батчевым вызовом декодера RNN-T) на раунд чанков. Созданные через него сессии при `push` только буферизуют аудио; `batch.step()` кодирует все сессии, у которых накопился полный чанк. Потоки могут подключаться в любой момент, иметь разную историю и уходить через `finish()`; результат каждого потока совпадает с результатом того же аудио через одиночную сессию. `model.transcribe_streaming_batch(paths)` делает то же для списка файлов.
+
+```python
+batch = gigaam.StreamingBatch(model, word_timestamps=True)
+sessions = {client_id: batch.new_session() for client_id in clients}
+while clients_active():
+    for client_id, pcm in receive_audio():      # всё, что пришло с прошлого раунда
+        sessions[client_id].push(pcm)
+    batch.step()                                # один вызов энкодера на все готовые чанки
+    for client_id, s in sessions.items():
+        send_partial(client_id, s.text)
+final = sessions[client_id].finish()            # когда клиент отключился
+```
+
+* FP8-квантование совместимо с потоковым режимом (сначала `enable_streaming`, затем `gigaam.fp8.quantize_model`).
 
 ### Дообучение моделей
 

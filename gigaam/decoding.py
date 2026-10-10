@@ -151,25 +151,35 @@ class RNNTGreedyDecoding:
         b = h.shape[1]
         return [(h[:, i : i + 1], c[:, i : i + 1]) for i in range(b)]
 
-    @torch.inference_mode()
-    def decode(
+    def _greedy(
         self,
         head: "RNNTHead",
-        encoded: Tensor,
+        x: Tensor,
         enc_len: Tensor,
-    ) -> List[Tuple[str, List[int], List[int]]]:
+        last_label: List[Optional[Tensor]],
+        dec_state: List[Optional[Tuple[Tensor, Tensor]]],
+        frame_offset: List[int],
+    ) -> Tuple[
+        List[List[int]],
+        List[List[int]],
+        List[Optional[Tensor]],
+        List[Optional[Tuple[Tensor, Tensor]]],
+    ]:
         """
-        RNN-T greedy decode: returns (text, token_ids, token_frames) per sample.
-        Token frames are encoder time indices where tokens are emitted.
+        Batched RNN-T greedy core over ``x`` ``[B, T, D]``. Per sample it carries
+        the predictor LSTM state and the last emitted label *in* (``None`` for a
+        fresh utterance) and *out*, so the same loop serves the offline decode
+        (everything ``None``) and the chunked streaming decode (state threaded
+        across chunk boundaries). Emitted frames are ``frame_offset[b] + t``.
+        The predictor state advances only on a non-blank emission, exactly as in
+        the original offline loop.
         """
-        x = encoded.transpose(1, 2)  # [B, T, D]
         B, T, _ = x.shape
         device = x.device
-
         hyps: List[List[int]] = [[] for _ in range(B)]
         token_frames: List[List[int]] = [[] for _ in range(B)]
-        last_label: List[Optional[Tensor]] = [None] * B
-        dec_state: List[Optional[Tuple[Tensor, Tensor]]] = [None] * B
+        last_label = list(last_label)
+        dec_state = list(dec_state)
 
         def emit_batch(batch_idx: List[int], t: int, fresh: bool) -> List[int]:
             """One batched predictor+joint step; returns samples that emitted non-blank."""
@@ -199,7 +209,7 @@ class RNNTGreedyDecoding:
                 tok = int(k[p])
 
                 hyps[bi].append(tok)
-                token_frames[bi].append(t)
+                token_frames[bi].append(frame_offset[bi] + t)
                 last_label[bi] = k[p : p + 1].view(1, 1)
                 dec_state[bi] = hidden_parts[p]
                 out.append(bi)
@@ -230,7 +240,74 @@ class RNNTGreedyDecoding:
 
                 active = next_active
 
+        return hyps, token_frames, last_label, dec_state
+
+    @torch.inference_mode()
+    def decode(
+        self,
+        head: "RNNTHead",
+        encoded: Tensor,
+        enc_len: Tensor,
+    ) -> List[Tuple[str, List[int], List[int]]]:
+        """
+        RNN-T greedy decode: returns (text, token_ids, token_frames) per sample.
+        Token frames are encoder time indices where tokens are emitted.
+        """
+        x = encoded.transpose(1, 2)  # [B, T, D]
+        B = x.shape[0]
+        hyps, token_frames, _, _ = self._greedy(
+            head, x, enc_len, [None] * B, [None] * B, [0] * B
+        )
         return [(self.tokenizer.decode(h), h, tf) for h, tf in zip(hyps, token_frames)]
+
+    @torch.inference_mode()
+    def decode_chunk_batched(
+        self,
+        head: "RNNTHead",
+        enc_chunks: Tensor,
+        dec_states: List[Optional[Tuple[Tensor, Tensor]]],
+        last_labels: List[int],
+        frame_offsets: List[int],
+    ) -> Tuple[
+        List[List[int]],
+        List[List[int]],
+        List[Optional[Tuple[Tensor, Tensor]]],
+        List[int],
+    ]:
+        """
+        Incremental RNN-T greedy decode for one chunk of ``B`` independent
+        streams: ``enc_chunks`` is channels-first ``[B, enc_hidden, n]``;
+        ``dec_states[b]`` / ``last_labels[b]`` / ``frame_offsets[b]`` are stream
+        ``b``'s carried predictor state (``None`` before its first emission), last
+        emitted label (``blank_id`` initially) and absolute encoder-frame offset.
+        Returns per-stream ``(ids, frames)`` lists plus the updated states and
+        labels. Streams are independent: concatenating a stream's per-chunk
+        tokens reproduces :meth:`decode` on its whole sequence.
+        """
+        x = enc_chunks.transpose(1, 2)  # [B, n, D]
+        B, n, _ = x.shape
+        device = x.device
+        labels_t: List[Optional[Tensor]] = [
+            (
+                None
+                if st is None
+                else torch.tensor([[lab]], device=device, dtype=torch.long)
+            )
+            for st, lab in zip(dec_states, last_labels)
+        ]
+        hyps, frames, labels_out, states_out = self._greedy(
+            head,
+            x,
+            torch.full((B,), n, dtype=torch.long),
+            labels_t,
+            list(dec_states),
+            list(frame_offsets),
+        )
+        new_labels = [
+            last_labels[b] if labels_out[b] is None else int(labels_out[b].item())
+            for b in range(B)
+        ]
+        return hyps, frames, states_out, new_labels
 
     @torch.inference_mode()
     def decode_chunk(
@@ -242,55 +319,12 @@ class RNNTGreedyDecoding:
         frame_offset: int,
     ) -> Tuple[List[int], List[int], Optional[Tuple[Tensor, Tensor]], int]:
         """
-        Incremental RNN-T greedy decode for one streaming chunk (batch size 1).
-        A batch-1 port of :meth:`decode`: for each encoder frame in ``enc_chunk``
-        run the ``max_symbols`` predictor+joint emit loop, threading the predictor
-        LSTM state ``(h, c)`` and the previous label across frames *and* across
-        chunk boundaries (via ``dec_state`` / ``last_label``). The first prediction
-        of the utterance is fresh (``predict(None, None)``); every later one feeds
-        ``last_label`` and the carried state.
-
-        Parameters mirror what a streaming driver carries between chunks:
-        ``enc_chunk`` is channels-first ``[1, enc_hidden, n]``; ``dec_state`` is
-        the predictor ``(h, c)`` (``None`` on the first chunk); ``last_label`` is
-        ``blank_id`` initially, then the most recently emitted token; and
-        ``frame_offset`` is the absolute encoder frame index where this chunk
-        begins (so emitted frames are utterance-global). Returns
-        ``(ids, frames, dec_state, last_label)`` -- accumulate ``ids``/``frames``
-        across chunks and ``tokenizer.decode`` them once at the end. Concatenating
-        the per-chunk token streams reproduces :meth:`decode` on the whole sequence.
+        Incremental RNN-T greedy decode for one streaming chunk of a single
+        stream (``enc_chunk`` is ``[1, enc_hidden, n]``); see
+        :meth:`decode_chunk_batched` for the parameters. Returns
+        ``(ids, frames, dec_state, last_label)``.
         """
-        x = enc_chunk.transpose(1, 2)  # [1, n, D]
-        _, n, _ = x.shape
-        device = x.device
-
-        ids: List[int] = []
-        frames: List[int] = []
-        # last_label is an int (blank_id or a token id); build the predictor input
-        # tensor lazily from it on each stateful step, matching the offline loop's
-        # k[p:p+1].view(1, 1) shape.
-
-        for t in range(n):
-            f = x[:, t : t + 1, :]  # [1, 1, D]
-            for _ in range(self.max_symbols):
-                if dec_state is None:
-                    g, hidden = head.decoder.predict(None, None, batch_size=1)
-                else:
-                    label = torch.tensor(
-                        [[last_label]], device=device, dtype=torch.long
-                    )
-                    g, hidden = head.decoder.predict(label, dec_state, batch_size=1)
-
-                k = head.joint.joint(f, g)[:, 0, 0, :].argmax(dim=-1)  # [1]
-                tok = int(k[0])
-                if tok == self.blank_id:
-                    break  # blank ends this frame's emit loop; advance to next frame
-
-                ids.append(tok)
-                frames.append(frame_offset + t)
-                last_label = tok
-                dec_state = hidden  # carry the predictor state forward
-            # On blank we leave dec_state/last_label as-is for the next frame,
-            # exactly as the offline loop does (it only updates them on emission).
-
-        return ids, frames, dec_state, last_label
+        hyps, frames, states, labels = self.decode_chunk_batched(
+            head, enc_chunk, [dec_state], [last_label], [frame_offset]
+        )
+        return hyps[0], frames[0], states[0], labels[0]

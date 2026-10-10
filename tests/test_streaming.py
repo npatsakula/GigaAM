@@ -429,6 +429,144 @@ def test_hf_streaming_config_round_trip():
     assert hasattr(model, "transcribe_streaming")
 
 
+def _run_schedule(enc, streams, joins, batched):
+    """Feed several streams chunk-by-chunk; stream ``i`` joins at round
+    ``joins[i]``. ``batched`` runs every active stream of a round in one
+    forward_streaming_chunk_batched call (grouped by look-ahead stage as
+    StreamingBatch does); otherwise each stream runs alone. Returns per-stream
+    concatenated outputs (flushed at the end)."""
+    states = [enc.init_streaming_state() for _ in streams]
+    outs = [[] for _ in streams]
+    pos = [0] * len(streams)
+    step = CHUNK * SUB
+    n_rounds = max(joins) + max(x.shape[-1] for x in streams) // step + 2
+    for r in range(n_rounds):
+        active = [
+            i
+            for i, x in enumerate(streams)
+            if r >= joins[i] and pos[i] + step <= x.shape[-1]
+        ]
+        if not active:
+            continue
+        if batched:
+            if enc.right_context_chunks == 0:
+                groups = [active]
+            else:
+                groups = [
+                    [i for i in active if states[i].pending_feat is None],
+                    [i for i in active if states[i].pending_feat is not None],
+                ]
+            for g in groups:
+                if not g:
+                    continue
+                blocks = torch.cat(
+                    [streams[i][:, :, pos[i] : pos[i] + step] for i in g], dim=0
+                )
+                y = enc.forward_streaming_chunk_batched(blocks, [states[i] for i in g])
+                for b, i in enumerate(g):
+                    outs[i].append(y[b : b + 1])
+        else:
+            for i in active:
+                y = enc.forward_streaming_chunk(
+                    streams[i][:, :, pos[i] : pos[i] + step], states[i]
+                )
+                outs[i].append(y)
+        for i in active:
+            pos[i] += step
+    for i, x in enumerate(streams):
+        if pos[i] < x.shape[-1]:  # ragged tail, alone (as finish() does)
+            outs[i].append(enc.forward_streaming_chunk(x[:, :, pos[i] :], states[i]))
+        outs[i].append(enc.flush_streaming(states[i]))
+    return [torch.cat([o for o in out if o.shape[-1] > 0], dim=2) for out in outs]
+
+
+@pytest.mark.parametrize("right_context_chunks", [0, 1])
+@pytest.mark.parametrize("left_context_chunks", [-1, 2])
+def test_batched_streams_match_single(right_context_chunks, left_context_chunks):
+    """Several streams of different lengths joining at different rounds, run
+    batched (padded + masked caches, per-stream rotary offsets) must each equal
+    the same stream run alone, which equals the full forward."""
+    torch.manual_seed(0)
+    enc = ConformerEncoder(
+        **dict(SMALL_KW, n_layers=3),
+        streaming=True,
+        chunk_size=CHUNK,
+        left_context_chunks=left_context_chunks,
+        right_context_chunks=right_context_chunks,
+    ).eval()
+    lengths = [320, 200, 259, 96]
+    joins = [0, 2, 1, 5]
+    streams = [torch.randn(1, 64, t) for t in lengths]
+    with torch.inference_mode():
+        single = _run_schedule(enc, streams, joins, batched=False)
+        batched = _run_schedule(enc, streams, joins, batched=True)
+        for i, x in enumerate(streams):
+            full, _ = enc(x, torch.tensor([x.shape[-1]]))
+            assert full.shape == batched[i].shape == single[i].shape
+            d_single = (full - single[i]).abs().max().item()
+            d_batched = (full - batched[i]).abs().max().item()
+            assert d_single < 1e-4, f"stream {i} single: {d_single}"
+            assert d_batched < 1e-4, (
+                f"rc={right_context_chunks} left={left_context_chunks} stream {i}: "
+                f"batched max|diff|={d_batched}"
+            )
+
+
+def test_rnnt_decode_chunk_batched_matches_single():
+    """Batched chunk decode of independent streams with different carried
+    states, labels and offsets == each stream decoded alone == offline decode."""
+    from gigaam.decoder import RNNTHead
+    from gigaam.decoding import RNNTGreedyDecoding
+
+    D = 16
+    torch.manual_seed(0)
+    head = RNNTHead(
+        decoder={"pred_hidden": D, "pred_rnn_layers": 1, "num_classes": 8},
+        joint={"enc_hidden": D, "pred_hidden": D, "joint_hidden": D, "num_classes": 8},
+    ).eval()
+    dec = RNNTGreedyDecoding(vocabulary=[chr(97 + i) for i in range(7)])
+    T = 48
+    encs = [torch.randn(1, D, T) for _ in range(3)]
+    with torch.inference_mode():
+        refs = [dec.decode(head, e, torch.tensor([T]))[0][1] for e in encs]
+        # stream 1 starts one chunk late, stream 2 two chunks late (different
+        # offsets/states while batched)
+        starts = [0, CHUNK, 2 * CHUNK]
+        ids = [[] for _ in encs]
+        states = [None] * 3
+        labels = [dec.blank_id] * 3
+        offs = [0] * 3
+        for r in range(0, T, CHUNK):
+            active = [i for i in range(3) if starts[i] <= r]
+            chunk = torch.cat(
+                [encs[i][:, :, offs[i] : offs[i] + CHUNK] for i in active]
+            )
+            out_ids, _, out_states, out_labels = dec.decode_chunk_batched(
+                head,
+                chunk,
+                [states[i] for i in active],
+                [labels[i] for i in active],
+                [offs[i] for i in active],
+            )
+            for b, i in enumerate(active):
+                ids[i].extend(out_ids[b])
+                states[i], labels[i] = out_states[b], out_labels[b]
+                offs[i] += CHUNK
+        for i in range(3):  # late starters finish their remaining chunks alone
+            while offs[i] < T:
+                out_ids, _, states[i], labels[i] = dec.decode_chunk(
+                    head,
+                    encs[i][:, :, offs[i] : offs[i] + CHUNK],
+                    states[i],
+                    labels[i],
+                    offs[i],
+                )
+                ids[i].extend(out_ids)
+                offs[i] += CHUNK
+    for i in range(3):
+        assert ids[i] == refs[i], f"stream {i}: batched RNN-T decode diverged"
+
+
 @pytest.mark.parametrize("right_context_chunks", [0, 1])
 @pytest.mark.parametrize("left_context_chunks", [-1, 16])
 @pytest.mark.partial

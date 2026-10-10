@@ -214,6 +214,102 @@ def test_transcribe_streaming_uses_session(tmp_path):
         assert res.words == session.result().words
 
 
+def _run_batch(model, wavs, pushes, joins, word_timestamps=False, max_batch_size=64):
+    """Drive several sessions through one StreamingBatch: stream i joins at
+    round joins[i] and receives pushes[i] samples per round; the batch steps
+    after every round; a stream finishes as soon as its audio is exhausted."""
+    from gigaam.streaming import StreamingBatch
+
+    batch = StreamingBatch(
+        model, word_timestamps=word_timestamps, max_batch_size=max_batch_size
+    )
+    sessions = [None] * len(wavs)
+    pos = [0] * len(wavs)
+    r = 0
+    while any(s is None or not s.finished for s in sessions):
+        for i, wav in enumerate(wavs):
+            if r < joins[i]:
+                continue
+            if sessions[i] is None:
+                sessions[i] = batch.new_session()
+            if sessions[i].finished:
+                continue
+            sessions[i].push(wav[pos[i] : pos[i] + pushes[i]])
+            pos[i] += pushes[i]
+        batch.step()
+        for i, wav in enumerate(wavs):
+            if (
+                sessions[i] is not None
+                and not sessions[i].finished
+                and pos[i] >= wav.numel()
+            ):
+                sessions[i].finish()
+        r += 1
+        assert r < 10_000
+    assert not batch.sessions
+    return sessions
+
+
+@pytest.mark.parametrize("mode", ["ctc", "rnnt"])
+@pytest.mark.parametrize("right_context_chunks", [0, 1])
+def test_streaming_batch_matches_single_sessions(mode, right_context_chunks):
+    """Sessions served by a StreamingBatch (joining at different rounds, pushed
+    in different piece sizes, finishing at different times) must each produce
+    exactly what the same audio produces through a lone StreamingSession."""
+    model = _tiny_model(mode, right_context_chunks)
+    wavs = [_audio(2.37, 1), _audio(1.2, 2), _audio(3.01, 3), _audio(0.5, 4)]
+    pushes = [4000, 5120, 1234, 7000]
+    joins = [0, 3, 1, 6]
+    batched = _run_batch(
+        model, wavs, pushes, joins, word_timestamps=True, max_batch_size=3
+    )
+    for i, wav in enumerate(wavs):
+        alone, _ = _run_session(model, wav, 4000, word_timestamps=True)
+        assert (
+            batched[i]._ids == alone._ids
+        ), f"{mode} rc={right_context_chunks} stream {i}"
+        assert batched[i]._frames == alone._frames
+        assert batched[i].result() == alone.result()
+        ref_ids, _, _ = _reference(model, wav)
+        assert batched[i]._ids == ref_ids
+
+
+def test_transcribe_streaming_batch_matches_single(tmp_path):
+    import soundfile as sf
+
+    model = _tiny_model("ctc")
+    paths = []
+    for i, sec in enumerate((1.7, 0.9, 2.4)):
+        path = tmp_path / f"{i}.wav"
+        sf.write(str(path), _audio(sec, 10 + i).numpy(), SR)
+        paths.append(str(path))
+    results = model.transcribe_streaming_batch(paths, word_timestamps=True)
+    assert len(results) == 3
+    for path, res in zip(paths, results):
+        assert res == model.transcribe_streaming(path, word_timestamps=True)
+
+
+def test_batch_session_lifecycle():
+    model = _tiny_model("ctc")
+    from gigaam.streaming import StreamingBatch
+
+    batch = StreamingBatch(model)
+    a, b = batch.new_session(), batch.new_session()
+    assert batch.sessions == [a, b]
+    a.push(_audio(1.0, 1))
+    assert a.text == ""  # buffered only; nothing encoded before step()
+    assert batch.step() >= 1
+    assert a._enc_frames > 0 and b._enc_frames == 0
+    assert batch.step() == 0  # nothing new buffered
+    a.finish()
+    assert batch.sessions == [b]
+    a.reset()  # a reused session re-joins its batch
+    assert batch.sessions == [b, a]
+    b.finish()
+    a.finish()
+    assert batch.sessions == []
+
+
 @pytest.mark.parametrize("name", ["v3_ctc", "v3_rnnt", "v3_e2e_ctc", "v3_e2e_rnnt"])
 @pytest.mark.partial
 def test_real_model_session_parity(name):
@@ -236,6 +332,11 @@ def test_real_model_session_parity(name):
         assert session._ids == ref_ids
         assert session._frames == ref_frames
     assert model.transcribe_streaming(path).text == ref_text
+    # two concurrent streams (the file and its second half) through one batch
+    half = wav[wav.numel() // 2 :]
+    batched = _run_batch(model, [wav, half], [1600, 2400], [0, 2])
+    assert batched[0]._ids == ref_ids
+    assert batched[1]._ids == _reference(model, half)[0]
 
 
 @pytest.mark.partial

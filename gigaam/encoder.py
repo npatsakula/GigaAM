@@ -186,33 +186,45 @@ class StridingSubsampling(nn.Module):
     def forward_streaming(self, x: Tensor, state: "StreamingState") -> Tensor:
         """
         Causal subsampling for one streaming chunk (conv1d only). ``x`` is
-        channels-first ``[b, feat_in, t]``. Each conv stage prepends its cached
+        channels-first ``[1, feat_in, t]``. Each conv stage prepends its cached
         last ``kernel-1`` input frames (zeros on the first chunk, which matches
         the full forward's causal left-pad) instead of zero-padding, so the
         concatenation of all chunks reproduces the full forward exactly.
         """
+        return self.forward_streaming_batched(x, [state])
+
+    def forward_streaming_batched(
+        self, x: Tensor, states: List["StreamingState"]
+    ) -> Tensor:
+        """
+        :meth:`forward_streaming` for a batch of independent streams: ``x`` is
+        ``[B, feat_in, t]`` with one chunk per stream (all the same length) and
+        ``states[b]`` is stream ``b``'s state, updated in place. Streams may be
+        at different stages (a fresh stream's cache is zeros).
+        """
         assert self.subsampling_type == "conv1d" and self.causal
+        assert x.shape[0] == len(states)
         out = x
         ci = 0
         left = self._kernel_size - 1
         for module in self.conv:
             if isinstance(module, torch.nn.Conv1d):
-                cache = state.subs_cache[ci]
-                if cache is None:
-                    cache = torch.zeros(
-                        out.shape[0],
-                        out.shape[1],
-                        left,
-                        device=out.device,
-                        dtype=out.dtype,
-                    )
+                zeros = out.new_zeros(1, out.shape[1], left)
+                cache = torch.cat(
+                    [
+                        s.subs_cache[ci] if s.subs_cache[ci] is not None else zeros
+                        for s in states
+                    ],
+                    dim=0,
+                )
                 inp = torch.cat([cache, out], dim=2)
-                state.subs_cache[ci] = inp[:, :, inp.shape[2] - left :]
+                for b, s in enumerate(states):
+                    s.subs_cache[ci] = inp[b : b + 1, :, inp.shape[2] - left :]
                 out = module(inp)
                 ci += 1
             else:
                 out = module(out)  # ReLU
-        return out  # [b, d_model, t_enc]
+        return out  # [B, d_model, t_enc]
 
 
 class MultiHeadAttention(nn.Module, ABC):
@@ -367,15 +379,21 @@ class RotaryPositionMultiHeadAttention(MultiHeadAttention):
         cos: Tensor,
         sin: Tensor,
         kv_cache: Optional[Tuple[Tensor, Tensor]],
+        kv_valid: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
         """
         Cache-aware self-attention for one chunk. ``x`` is ``[b, n, d]``; ``cos``/
         ``sin`` are the rotary tables sliced to this chunk's absolute positions
-        ``[J, J+n)`` (so ``offset=0`` here). New keys/values are appended to the
+        ``[J, J+n)`` (so ``offset=0`` here), either shared ``[n, 1, 1, d_k]`` or
+        per stream ``[n, b, 1, d_k]``. New keys/values are appended to the
         running cache and the query attends to the full left context + current
-        chunk with no mask -- which reproduces the training block mask under
-        unlimited left context. Keys are cached post-rotation; cached keys are
-        never re-rotated (RoPE relative-phase property preserves parity).
+        chunk -- which reproduces the training block mask under unlimited left
+        context. Keys are cached post-rotation; cached keys are never re-rotated
+        (RoPE relative-phase property preserves parity).
+
+        ``kv_valid`` (``[b, T_cache]``, True = real key) masks the left padding
+        of a batch of streams whose caches have different lengths; the ``n`` new
+        keys are always valid. ``None`` means every cached key is real.
         """
         b, n, _ = x.shape
         xh = x.transpose(0, 1).view(n, b, self.h, self.d_k)
@@ -388,7 +406,11 @@ class RotaryPositionMultiHeadAttention(MultiHeadAttention):
         if kv_cache is not None:
             k = torch.cat([kv_cache[0], k], dim=2)
             v = torch.cat([kv_cache[1], v], dim=2)
-        attn_output = F.scaled_dot_product_attention(q, k, v)
+        attn_mask = None
+        if kv_valid is not None:
+            new_valid = torch.ones(b, n, dtype=torch.bool, device=x.device)
+            attn_mask = torch.cat([kv_valid, new_valid], dim=1)[:, None, None, :]
+        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         attn_output = attn_output.transpose(1, 2).reshape(b, n, self.h * self.d_k)
         return self.linear_out(attn_output), (k, v)
 
@@ -741,6 +763,7 @@ class ConformerLayer(nn.Module):
         kv_cache: Optional[Tuple[Tensor, Tensor]],
         conv_cache: Optional[Tensor],
         lookahead_len: int = 0,
+        kv_valid: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tuple[Tensor, Tensor], Tensor]:
         """Cache-aware Conformer block for one chunk. Mirrors ``forward`` exactly
         but threads the attention KV-cache and depthwise-conv cache.
@@ -751,14 +774,17 @@ class ConformerLayer(nn.Module):
         keys), and the depthwise-conv cache retains the pending chunk's tail. The
         attention KV cache is returned UN-trimmed (cache + pending + lookahead);
         the caller drops the look-ahead frames so the persistent cache holds only
-        emitted (left-context) keys."""
+        emitted (left-context) keys. ``kv_valid`` masks left padding in a batch of
+        streams with unequal cache lengths (see the attention module)."""
         residual = x
         x = self.norm_feed_forward1(x)
         x = self.feed_forward1(x)
         residual = residual + x * self.fc_factor
 
         x = self.norm_self_att(residual)
-        x, new_kv = self.self_attn.forward_streaming(x, cos, sin, kv_cache)
+        x, new_kv = self.self_attn.forward_streaming(
+            x, cos, sin, kv_cache, kv_valid=kv_valid
+        )
         residual = residual + x
 
         x = self.norm_conv(residual)
@@ -1102,21 +1128,27 @@ class ConformerEncoder(nn.Module):
         return StreamingState(len(self.layers), n_subs)
 
     def _rotary_for(
-        self, j: int, n: int, device: torch.device
+        self, js: List[int], n: int, device: torch.device
     ) -> Tuple[Tensor, Tensor]:
         """Cos/sin tables for ``n`` encoder frames starting at absolute position
-        ``j``, growing the rotary buffer when the stream exceeds ``pos_emb_max_len``."""
+        ``js[b]`` for stream ``b``: shared ``[n, 1, 1, d_k]`` tables when every
+        offset agrees (the single-stream case), per-stream ``[n, B, 1, d_k]``
+        tables otherwise. Grows the rotary buffer when a stream exceeds
+        ``pos_emb_max_len``; cos/sin are position-wise, so growing it never
+        changes values already used for earlier positions."""
         pe = self.pos_enc.pe
         half = pe.shape[0] // 2
-        # Grow the rotary buffer for streams longer than pos_emb_max_len (default
-        # 5000 -> half=2500 encoder frames ~= 100 s at 25 fps). Rotary cos/sin
-        # are position-wise, so extending the buffer does not change the values
-        # already emitted for earlier positions; it only appends higher indices.
-        if j + n > half:
-            self.pos_enc.extend_pe(j + n, device)
+        need = max(js) + n
+        if need > half:
+            self.pos_enc.extend_pe(need, device)
             pe = self.pos_enc.pe
             half = pe.shape[0] // 2
-        return pe[j : j + n], pe[half + j : half + j + n]
+        if all(j == js[0] for j in js):
+            j = js[0]
+            return pe[j : j + n], pe[half + j : half + j + n]
+        cos = torch.cat([pe[j : j + n] for j in js], dim=1)
+        sin = torch.cat([pe[half + j : half + j + n] for j in js], dim=1)
+        return cos, sin
 
     def _evict_left_context(self, state: StreamingState) -> None:
         """Bound each layer's attention cache to the training left-context window.
@@ -1127,14 +1159,83 @@ class ConformerEncoder(nn.Module):
             keep = self.left_context_chunks * self.chunk_size
             state.kv = [self._trim_kv(kv, keep) for kv in state.kv]
 
+    @staticmethod
+    def _stack_kv(
+        kvs: List[Optional[Tuple[Tensor, Tensor]]],
+    ) -> Tuple[Optional[Tuple[Tensor, Tensor]], Optional[Tensor], List[int]]:
+        """Stack per-stream attention caches for one batched step, left-padding
+        shorter ones with zeros. Returns the stacked ``(k, v)`` (``None`` when no
+        stream has a cache yet), a ``[B, T]`` validity mask (``None`` when all
+        lengths agree, so the single-stream numerics are untouched) and the
+        per-stream cache lengths."""
+        lens = [0 if kv is None else kv[0].shape[2] for kv in kvs]
+        t_max = max(lens)
+        if t_max == 0:
+            return None, None, lens
+        if all(ln == t_max for ln in lens):
+            k = torch.cat([kv[0] for kv in kvs if kv is not None], dim=0)
+            v = torch.cat([kv[1] for kv in kvs if kv is not None], dim=0)
+            return (k, v), None, lens
+        ref = next(kv for kv in kvs if kv is not None)
+        b = len(kvs)
+        k = ref[0].new_zeros(b, ref[0].shape[1], t_max, ref[0].shape[3])
+        v = torch.zeros_like(k)
+        valid = torch.zeros(b, t_max, dtype=torch.bool, device=k.device)
+        for i, kv in enumerate(kvs):
+            if kv is not None:
+                k[i, :, t_max - lens[i] :] = kv[0][0]
+                v[i, :, t_max - lens[i] :] = kv[1][0]
+                valid[i, t_max - lens[i] :] = True
+        return (k, v), valid, lens
+
+    @staticmethod
+    def _stack_conv(convs: List[Optional[Tensor]]) -> Optional[Tensor]:
+        """Stack per-stream depthwise-conv caches (zeros for a fresh stream)."""
+        if all(c is None for c in convs):
+            return None
+        ref = next(c for c in convs if c is not None)
+        return torch.cat(
+            [c if c is not None else torch.zeros_like(ref) for c in convs], dim=0
+        )
+
+    def _run_layers_batched(
+        self, x: Tensor, states: List[StreamingState], lookahead_len: int
+    ) -> Tensor:
+        """Run the Conformer stack over ``x`` ``[B, n, d]`` (one chunk, or
+        ``[pending, look-ahead]``, per stream) threading every stream's caches,
+        which are gathered (left-padded + masked when lengths differ) before each
+        layer and scattered back, trimmed, afterwards. Streams may have different
+        histories and rotary offsets; with a single stream the gathered tensors
+        are the stream's own, so this is also the single-stream path."""
+        n_tot = x.shape[1]
+        cos, sin = self._rotary_for([s.processed for s in states], n_tot, x.device)
+        for i, layer in enumerate(self.layers):
+            kv, valid, lens = self._stack_kv([s.kv[i] for s in states])
+            conv = self._stack_conv([s.conv[i] for s in states])
+            x, full_kv, new_conv = layer.forward_streaming(
+                x, cos, sin, kv, conv, lookahead_len=lookahead_len, kv_valid=valid
+            )
+            t_pad = full_kv[0].shape[2] - n_tot
+            for b, s in enumerate(states):
+                start = t_pad - lens[b]  # skip this stream's left padding
+                kv_b = (
+                    full_kv[0][b : b + 1, :, start:].clone(),
+                    full_kv[1][b : b + 1, :, start:].clone(),
+                )
+                s.kv[i] = self._drop_lookahead_kv(kv_b, lookahead_len)
+                s.conv[i] = new_conv[b : b + 1].clone()
+        for s in states:
+            self._evict_left_context(s)
+        return x
+
     def forward_streaming_chunk(
         self, feat_chunk: Tensor, state: StreamingState
     ) -> Tensor:
         """
         Encode one streaming chunk of features, updating ``state`` in place.
-        ``feat_chunk`` is channels-first ``[b, feat_in, t_feat]`` (raw log-mel,
+        ``feat_chunk`` is channels-first ``[1, feat_in, t_feat]`` (raw log-mel,
         e.g. 32 feature frames -> 8 encoder frames at chunk_size=8). Returns the
-        encoded chunk ``[b, d_model, n_enc]``.
+        encoded chunk ``[1, d_model, n_enc]``.
 
         Every call except the last must carry a whole number of encoder frames,
         i.e. ``t_feat`` a multiple of the subsampling factor (and normally exactly
@@ -1151,93 +1252,67 @@ class ConformerEncoder(nn.Module):
         query in chunk ``c`` must attend to keys in chunk ``c+1``. The most
         recently subsampled chunk is held in ``state.pending_feat``; the next call
         pairs it with the fresh chunk so the pending chunk's queries see the fresh
-        chunk's keys, and the pending chunk is then emitted. The first call
-        therefore emits nothing (it only buffers), and the final pending chunk is
-        drained by :meth:`flush_streaming`. Concatenating outputs reproduces the
-        hard-copy ``forward`` exactly at any depth (verified by parity test).
-        Per-call cost is O(chunk_size * n_layers) with a bounded left context.
+        chunk's keys (computed with exactly the context the hard-copy training
+        forward gives its copy), and the pending chunk is then emitted. The first
+        call therefore emits nothing (it only buffers), and the final pending
+        chunk is drained by :meth:`flush_streaming`. Concatenating outputs
+        reproduces the hard-copy ``forward`` exactly at any depth (verified by
+        parity test). Per-call cost is O(chunk_size * n_layers) with a bounded
+        left context.
+        """
+        return self.forward_streaming_chunk_batched(feat_chunk, [state])
+
+    def forward_streaming_chunk_batched(
+        self, feat_chunk: Tensor, states: List[StreamingState]
+    ) -> Tensor:
+        """
+        :meth:`forward_streaming_chunk` for ``B`` independent streams in one
+        call: ``feat_chunk`` is ``[B, feat_in, t_feat]`` (the same ``t_feat`` for
+        every stream) and ``states[b]`` is stream ``b``'s own state, updated in
+        place. Streams may have joined at different times and have different
+        cache lengths and rotary offsets. Returns ``[B, d_model, n_enc]``.
+
+        With ``right_context_chunks == 1`` all streams in the call must be at the
+        same stage: either none has a pending chunk (they all just buffer and
+        nothing is emitted) or all have a pending chunk of the same length.
+        :class:`gigaam.streaming.StreamingBatch` groups streams accordingly.
         """
         assert self.streaming, "forward_streaming_chunk requires streaming=True"
+        assert feat_chunk.shape[0] == len(states), "one state per stream"
         if not hasattr(self.pos_enc, "pe"):
             self.pos_enc.extend_pe(self.pos_emb_max_len, feat_chunk.device)
 
-        if self.right_context_chunks == 0:
-            return self._forward_streaming_chunk_causal(feat_chunk, state)
-        return self._forward_streaming_chunk_defer(feat_chunk, state)
-
-    def _forward_streaming_chunk_causal(
-        self, feat_chunk: Tensor, state: StreamingState
-    ) -> Tensor:
-        """Strictly-causal (right_context_chunks=0) streaming path. Each chunk is
-        emitted immediately; concatenating outputs reproduces ``forward``."""
-        x = self.pre_encode.forward_streaming(feat_chunk, state)  # [b, d, n]
-        x = x.transpose(1, 2)  # [b, n, d]
-        n = x.shape[1]
+        x = self.pre_encode.forward_streaming_batched(feat_chunk, states)
+        x = x.transpose(1, 2)  # [B, n, d]
+        b, n, d = x.shape
         if n == 0:
-            return x.transpose(1, 2)
+            return x.transpose(1, 2)  # nothing subsampled; emit nothing
 
-        j = state.processed
-        cos, sin = self._rotary_for(j, n, feat_chunk.device)
+        if self.right_context_chunks == 0:
+            x = self._run_layers_batched(x, states, lookahead_len=0)
+            for s in states:
+                s.processed += n
+            return x.transpose(1, 2)  # [B, d, n]
 
-        for i, layer in enumerate(self.layers):
-            x, state.kv[i], state.conv[i] = layer.forward_streaming(
-                x, cos, sin, state.kv[i], state.conv[i]
-            )
-        self._evict_left_context(state)
-        state.processed += n
-        return x.transpose(1, 2)  # [b, d, n]
-
-    def _forward_streaming_chunk_defer(
-        self, feat_chunk: Tensor, state: StreamingState
-    ) -> Tensor:
-        """Right-context (defer=1) streaming path.
-
-        Subsample the new chunk only (the causal subsampling cache advances by
-        exactly this chunk -- no overlap, no double-count). If a pending chunk is
-        buffered, run the whole layer stack over ``[pending, new]`` so the pending
-        chunk's queries attend to the new chunk's keys (the 1-chunk look-ahead),
-        then emit the pending chunk and keep the new chunk as the next pending.
-        The attention KV cache holds only EMITTED (left-context) keys: the new
-        chunk's keys are used transiently and then trimmed off; the depthwise-conv
-        cache retains the pending chunk's tail (see ``lookahead_len``). All work is
-        over two chunks, so cost is O(chunk_size * n_layers) for a bounded left
-        context.
-
-        The look-ahead chunk is computed here with exactly the context the
-        hard-copy training forward gives its copy (left context + pending +
-        itself), so this path reproduces ``forward`` exactly at any depth."""
-        s_new = self.pre_encode.forward_streaming(feat_chunk, state)  # [b, d, n_new]
-        s_new = s_new.transpose(1, 2)  # [b, n_new, d]
-        n_new = s_new.shape[1]
-        if n_new == 0:
-            return s_new.transpose(1, 2)  # nothing subsampled; emit nothing
-
-        if state.pending_feat is None:
-            # First chunk: no look-ahead available yet. Buffer it and emit nothing.
-            state.pending_feat = s_new
-            return s_new.new_zeros(s_new.shape[0], s_new.shape[2], 0)
-
-        s_pend = state.pending_feat  # [b, n_pend, d]
-        n_pend = s_pend.shape[1]
-        x = torch.cat([s_pend, s_new], dim=1)  # [b, n_pend + n_new, d]
-        j = state.processed  # absolute offset of the pending chunk
-        cos, sin = self._rotary_for(j, n_pend + n_new, feat_chunk.device)
-
-        for i, layer in enumerate(self.layers):
-            x, full_kv, new_conv = layer.forward_streaming(
-                x, cos, sin, state.kv[i], state.conv[i], lookahead_len=n_new
-            )
-            # The attention appended BOTH chunks' keys to the cache. Drop the new
-            # (look-ahead) chunk's keys so only emitted left-context persists; the
-            # new chunk is fed fresh next call (as the pending half).
-            state.kv[i] = self._drop_lookahead_kv(full_kv, n_new)
-            state.conv[i] = new_conv
-
-        self._evict_left_context(state)
-        out_pend = x[:, :n_pend, :]  # emit the (now look-ahead-complete) chunk
-        state.processed += n_pend
-        state.pending_feat = s_new  # the fresh chunk awaits its own look-ahead
-        return out_pend.transpose(1, 2)  # [b, d, n_pend]
+        pend = [s.pending_feat for s in states]
+        if all(p is None for p in pend):
+            # First chunk of every stream: no look-ahead yet. Buffer, emit nothing.
+            for i, s in enumerate(states):
+                s.pending_feat = x[i : i + 1]
+            return x.new_zeros(b, d, 0)
+        assert all(p is not None for p in pend) and all(
+            p.shape[1] == pend[0].shape[1] for p in pend
+        ), "a batched look-ahead step needs every stream at the same stage"
+        n_pend = pend[0].shape[1]
+        xf = torch.cat([torch.cat(pend, dim=0), x], dim=1)  # [B, n_pend + n, d]
+        # The new chunk's keys are used transiently as look-ahead (dropped from
+        # the persistent cache by lookahead_len); the conv cache keeps the
+        # pending chunk's tail. See ConformerLayer.forward_streaming.
+        xf = self._run_layers_batched(xf, states, lookahead_len=n)
+        for i, s in enumerate(states):
+            s.processed += n_pend
+            s.pending_feat = x[i : i + 1]  # the fresh chunk awaits its look-ahead
+        return xf[:, :n_pend].transpose(1, 2)  # [B, d, n_pend]
 
     @staticmethod
     def _drop_lookahead_kv(
@@ -1254,32 +1329,25 @@ class ConformerEncoder(nn.Module):
     def flush_streaming(self, state: StreamingState) -> Tensor:
         """
         Drain the final buffered chunk at end of stream and return its encoding
-        ``[b, d_model, n]``. With ``right_context_chunks == 0`` nothing is ever
-        buffered, so this returns an empty tensor. With ``right_context_chunks >
-        0`` the last pending chunk has no real look-ahead (the stream ended), so it
-        is run alone -- exactly matching the training mask, whose look-ahead chunk
-        for the final query chunk simply does not exist. Safe to call once per
-        stream after the last :meth:`forward_streaming_chunk`; idempotent
-        (clears ``pending_feat``).
+        ``[1, d_model, n]``. With ``right_context_chunks == 0`` nothing is ever
+        buffered, so this returns an empty tensor. With ``right_context_chunks ==
+        1`` the last pending chunk has no real look-ahead (the stream ended), so
+        it is run alone -- exactly matching the training forward, whose look-ahead
+        copy for the final chunk is all padding. Safe to call once per stream
+        after the last :meth:`forward_streaming_chunk`; idempotent (clears
+        ``pending_feat``).
         """
         if self.right_context_chunks == 0 or state.pending_feat is None:
             state.pending_feat = None
             p = next(self.parameters())
             return torch.zeros(1, self.d_model, 0, device=p.device, dtype=p.dtype)
 
-        s_pend = state.pending_feat  # [b, n_pend, d]
+        s_pend = state.pending_feat  # [1, n_pend, d]
         n_pend = s_pend.shape[1]
-        j = state.processed
-        cos, sin = self._rotary_for(j, n_pend, s_pend.device)
-        x = s_pend
-        for i, layer in enumerate(self.layers):
-            x, state.kv[i], state.conv[i] = layer.forward_streaming(
-                x, cos, sin, state.kv[i], state.conv[i]
-            )
-        self._evict_left_context(state)
+        x = self._run_layers_batched(s_pend, [state], lookahead_len=0)
         state.processed += n_pend
         state.pending_feat = None
-        return x.transpose(1, 2)  # [b, d, n_pend]
+        return x.transpose(1, 2)  # [1, d, n_pend]
 
     @staticmethod
     def _trim_kv(
