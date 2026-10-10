@@ -10,6 +10,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 from utils import (
+    DurationBucketBatchSampler,
     EpochTimeLogger,
     StepProgressBar,
     build_exp_name,
@@ -69,8 +70,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--compile",
         action="store_true",
-        help="torch.compile the encoder with dynamic shapes (Conformer fusion); "
-        "helps fp16/bf16 fine-tunes on any GPU.",
+        help="torch.compile the encoder (and the KD teacher) with dynamic shapes; "
+        "the streaming forwards capture as a single graph with no breaks.",
+    )
+    p.add_argument(
+        "--compile_backend",
+        default="inductor",
+        help="torch.compile backend (inductor on CUDA; aot_eager to validate "
+        "capture where inductor cannot build kernels).",
+    )
+    p.add_argument(
+        "--bucket_by_duration",
+        action="store_true",
+        help="Batch clips of similar duration (shuffled buckets) so padded batches "
+        "carry little silence; typically 1.5-2x throughput on Golos-like data.",
     )
     p.add_argument(
         "--streaming",
@@ -221,14 +234,33 @@ def main():
     print(f"Train: {len(train_ds)}  Val: {len(val_ds)}")
 
     dl_kw = dict(num_workers=args.num_workers, pin_memory=True)
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        collate_fn=train_ds.collate_fn,
-        **dl_kw,
-    )
+    if args.num_workers > 0:
+        # Keep workers alive across epochs/validation and read ahead so the
+        # GPU never waits on wav decoding.
+        dl_kw.update(persistent_workers=True, prefetch_factor=4)
+    if args.bucket_by_duration:
+        train_sampler = DurationBucketBatchSampler(
+            [s.duration for s in train_ds.samples],
+            batch_size=args.batch_size,
+            seed=args.seed,
+            drop_last=True,
+        )
+        train_dl = DataLoader(
+            train_ds,
+            batch_sampler=train_sampler,
+            collate_fn=train_ds.collate_fn,
+            **dl_kw,
+        )
+        print(f"Duration bucketing: {len(train_sampler)} batches/epoch")
+    else:
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            collate_fn=train_ds.collate_fn,
+            **dl_kw,
+        )
     val_dl = DataLoader(
         val_ds,
         batch_size=args.eval_batch_size,
@@ -252,6 +284,7 @@ def main():
         time_masks=args.time_masks,
         time_width=args.time_width,
         compile=args.compile,
+        compile_backend=args.compile_backend,
         kd_alpha=args.kd_alpha,
         cli_args=vars(args),
     )
@@ -271,6 +304,8 @@ def main():
         devices=args.devices,
         strategy="ddp" if args.devices > 1 else "auto",
         precision=args.precision,
+        # The bucketing batch sampler partitions batches across ranks itself.
+        use_distributed_sampler=not args.bucket_by_duration,
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=args.gradient_clip_val,
         callbacks=(

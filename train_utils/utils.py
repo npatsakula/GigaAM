@@ -228,3 +228,71 @@ def prepare_experiment_dirs(output_dir: str, exp_name: str) -> Tuple[str, str]:
         )
     os.makedirs(model_dir, exist_ok=True)
     return model_dir, tb_dir
+
+
+class DurationBucketBatchSampler:
+    """
+    Batches of similar-duration clips, so padded batches carry little silence.
+
+    Each epoch: sort clips by duration, cut the sorted order into buckets of
+    ``batch_size * bucket_mult`` clips, shuffle inside every bucket, cut buckets
+    into batches and shuffle the batches. Clips in a batch then differ by at
+    most a bucket's duration spread while the epoch order stays random. Pass as
+    ``DataLoader(batch_sampler=...)``; Lightning calls :meth:`set_epoch`.
+
+    Under DDP (``torch.distributed`` initialized) every rank iterates its own
+    strided slice of the batch list, so ``Trainer(use_distributed_sampler=False)``
+    must be set; batches are truncated to a common count per rank.
+    """
+
+    def __init__(
+        self,
+        durations: List[float],
+        batch_size: int,
+        bucket_mult: int = 50,
+        seed: int = 0,
+        drop_last: bool = True,
+    ):
+        self.durations = list(durations)
+        self.batch_size = batch_size
+        self.bucket_mult = max(1, bucket_mult)
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _rank_world(self) -> Tuple[int, int]:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        return 0, 1
+
+    def _batches(self) -> List[List[int]]:
+        import random
+
+        rng = random.Random(self.seed + self.epoch)
+        order = sorted(range(len(self.durations)), key=lambda i: self.durations[i])
+        bucket = self.batch_size * self.bucket_mult
+        batches: List[List[int]] = []
+        for s in range(0, len(order), bucket):
+            idx = order[s : s + bucket]
+            rng.shuffle(idx)
+            for b in range(0, len(idx), self.batch_size):
+                batch = idx[b : b + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+        rng.shuffle(batches)
+        rank, world = self._rank_world()
+        if world > 1:
+            n = len(batches) // world * world
+            batches = batches[:n][rank::world]
+        return batches
+
+    def __iter__(self):
+        return iter(self._batches())
+
+    def __len__(self) -> int:
+        return len(self._batches())

@@ -120,6 +120,41 @@ python train.py \
 | `--skip_initial_validation` | off | Skip `trainer.validate` before `fit` |
 | `--resume_from_checkpoint` | `None` | Path to a Lightning `.ckpt` file to resume training from |
 
+## Streaming fine-tuning
+
+A base model patched into streaming mode (`gigaam.enable_streaming`) runs correctly but transcribes poorly: its weights never saw causal convolutions, chunked attention or a bounded context window. Streaming quality comes from a fine-tune in streaming mode that distills the offline model into the streaming one. The whole recipe for one H100 is scripted:
+
+```bash
+bash train_utils/streaming/setup_h100.sh        # uv venv, PyTorch 2.14.1 (CUDA 13.0), train extras
+source .venv-h100/bin/activate
+SMOKE=1 bash train_utils/streaming/run_pipeline.sh   # ~10 min end-to-end check on a tiny subset
+bash train_utils/streaming/run_pipeline.sh           # full run; see the header for the knobs
+```
+
+The pipeline has four stages, selectable with `STAGES="data pseudo train eval"`:
+
+1. **data** — `prepare_golos.py` materializes [govnejri/golos_mfa_punctuation](https://huggingface.co/datasets/govnejri/golos_mfa_punctuation) (970k clips, ~1044 h, 16 kHz) to WAV + manifests, shards in parallel, with the last shard held out for validation. `--train_hours` bounds a subset and reads only the shards it needs.
+2. **pseudo** — `pseudo_label.py` transcribes the training audio with the offline model, so the student is trained to restore the offline model rather than to fit the dataset's transcripts.
+3. **train** — `train.py --streaming` for each config in `CONFIGS` (default `rc1_c8 rc0_c16`, see below) with `--kd_alpha 0.5` (per-frame KL from the frozen offline teacher plus CTC on its pseudo-labels), `--precision bf16-mixed`, `--compile`, and `--bucket_by_duration`.
+4. **eval** — `eval_streaming.py` reports the restoration gap (WER/CER of the streaming model against the offline model's output), absolute WER against the dataset text, and the batched real-time factor.
+
+Streaming flags of `train.py`:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--streaming` | off | Fine-tune a streaming encoder (causal subsampling/convs + chunked attention). Adds no parameters; the checkpoint restores these settings on `gigaam.load_model`. |
+| `--chunk_size` | 8 | Chunk in encoder frames of 40 ms. A token is emitted once its chunk is complete, so latency is `chunk_size * 40 ms` (plus one chunk with look-ahead). |
+| `--left_context_chunks` | 16 | Attention window into the past, in chunks (16 = 5.1 s at chunk 8). Bounds the inference cache. `-1` = unlimited. |
+| `--right_context_chunks` | 0 | `1` adds one chunk of hard-copied (Emformer-style) look-ahead: latency doubles, the training forward is exactly the chunked inference computation, encoder cost ~2x. |
+| `--kd_alpha` | 0 | Distillation weight: `kd_alpha * KL(teacher || student) + (1 - kd_alpha) * CTC`. CTC models only; RNN-T streaming fine-tunes use the transducer loss on the teacher's pseudo-labels. |
+| `--init_from` | – | Warm-start the student from a fine-tuned checkpoint. |
+| `--compile`, `--compile_backend` | off, inductor | `torch.compile` the encoder and the teacher with dynamic shapes. Both streaming forwards capture as a single graph with no breaks. |
+| `--bucket_by_duration` | off | Batch clips of similar duration (shuffled buckets); typically 1.5-2x throughput on Golos-like data. |
+
+Configs in the pipeline: `rc1_c8` (320 ms chunks + one chunk of look-ahead, 640 ms latency), `rc0_c16` (640 ms chunks, strictly causal, same latency at half the training cost) and `rc0_c8` (320 ms, strictly causal, lowest latency). Train the first two and pick by the restoration gap; as a reference, FP8 quantization of the same models disagrees with fp16 at about 1.4% WER.
+
+Rough budget on one H100 with the defaults (bf16, compiled, bucketed, batch 32, 2 epochs over ~1000 h): on the order of 45k steps, a few hours per config. The fine-tuned checkpoint drops straight into `gigaam.StreamingSession` / `gigaam.StreamingBatch`.
+
 ## Evaluation
 
 Evaluate a fine-tuned checkpoint:

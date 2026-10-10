@@ -31,6 +31,7 @@ class GigaAMFineTuner(pl.LightningModule):
         time_masks: int = 2,
         time_width: int = 20,
         compile: bool = False,
+        compile_backend: str = "inductor",
         kd_alpha: float = 0.0,
         cli_args: Optional[Dict[str, Any]] = None,
     ):
@@ -81,14 +82,26 @@ class GigaAMFineTuner(pl.LightningModule):
             for p in self.encoder.parameters():
                 p.requires_grad = False
 
+        self._compile = compile
+        self._compile_backend = compile_backend
         if compile:
             # Compile the encoder in place. nn.Module.compile() keeps the module
             # identity and state_dict keys intact (unlike torch.compile(m), which
             # wraps in an OptimizedModule and prefixes keys with "_orig_mod."), so
             # checkpoints stay compatible with gigaam.load_model. dynamic=True avoids
             # a recompile per audio length; compilation is lazy (first forward).
-            self.encoder.compile(dynamic=True)
-            print("  torch.compile enabled on encoder (dynamic shapes)")
+            # The streaming forwards guard on a few shape-derived booleans
+            # (chunk padding, rotary growth), so allow more cache entries than
+            # the default 8 before dynamo gives up and falls back to eager.
+            import torch._dynamo
+
+            torch._dynamo.config.cache_size_limit = max(
+                torch._dynamo.config.cache_size_limit, 64
+            )
+            self.encoder.compile(dynamic=True, backend=compile_backend)
+            print(
+                f"  torch.compile enabled on encoder (dynamic shapes, {compile_backend})"
+            )
 
         self._val_errors = self._val_words = 0
 
@@ -157,6 +170,9 @@ class GigaAMFineTuner(pl.LightningModule):
             m.eval()
             for p in m.parameters():
                 p.requires_grad = False
+        if self._compile:
+            # The teacher runs a full forward every step; compile it too.
+            encoder.compile(dynamic=True, backend=self._compile_backend)
         self._teacher = (encoder, head)
 
     def _kd_loss(
@@ -238,7 +254,9 @@ class GigaAMFineTuner(pl.LightningModule):
     def training_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
         wavs, wav_lens, tokens, tok_lens = batch
 
-        kd_active = self._teacher is not None and self._kd_alpha > 0 and self.mode == "ctc"
+        kd_active = (
+            self._teacher is not None and self._kd_alpha > 0 and self.mode == "ctc"
+        )
         if kd_active:
             # Student sees SpecAugmented features; teacher sees clean ones.
             feats, feat_lens = self._features(wavs, wav_lens)

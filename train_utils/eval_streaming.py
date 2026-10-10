@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 
 import editdistance
+import torch
+from torch.nn.utils.rnn import pad_sequence
 
 import gigaam
 
@@ -49,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manifest", required=True)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--device", default=None)
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Streams decoded together (StreamingBatch) and offline batch size.",
+    )
     p.add_argument(
         "--chunk_size", type=int, default=8, help="Only for zero-shot patching"
     )
@@ -107,13 +115,39 @@ def main() -> None:
     gap_e = gap_w = abs_e = abs_w = 0
     gap_cer_e = gap_cer_n = abs_cer_e = abs_cer_n = 0
     audio_s = infer_s = 0.0
-    for i, row in enumerate(rows):
-        pth = Path(row["path"])
-        wav = str((pth if pth.is_absolute() else data_dir / pth).resolve())
-        ref_off = offline.transcribe(wav).text
+    paths = [
+        str(
+            (
+                Path(row["path"])
+                if Path(row["path"]).is_absolute()
+                else data_dir / row["path"]
+            ).resolve()
+        )
+        for row in rows
+    ]
+    # Batched: offline references through one padded forward per batch, the
+    # streaming model through StreamingBatch (identical results to one stream at
+    # a time; RTF is then the batched streaming compute per second of audio).
+    ref_texts: list[str] = []
+    hyps: list[str] = []
+    for s in range(0, len(paths), args.batch_size):
+        chunk = paths[s : s + args.batch_size]
+        wavs = [gigaam.load_audio(p).to(offline._device) for p in chunk]
+        lens = torch.tensor([w.shape[-1] for w in wavs], device=offline._device)
+        with torch.inference_mode():
+            enc, enc_len = offline.forward(
+                pad_sequence(wavs, batch_first=True).to(offline._dtype), lens
+            )
+            ref_texts.extend(
+                t for t, _, _ in offline.decoding.decode(offline.head, enc, enc_len)
+            )
         t0 = time.perf_counter()
-        hyp = stream_model.transcribe_streaming(wav).text
+        hyps.extend(r.text for r in stream_model.transcribe_streaming_batch(chunk))
         infer_s += time.perf_counter() - t0
+        print(f"  {min(s + args.batch_size, len(paths))}/{len(paths)}", flush=True)
+
+    for i, row in enumerate(rows):
+        ref_off, hyp = ref_texts[i], hyps[i]
         audio_s += float(row["duration"])
 
         e, w = wer(ref_off, hyp)
