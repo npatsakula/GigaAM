@@ -87,17 +87,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--left_context_chunks",
         type=int,
-        default=-1,
-        help="Streaming left-context window in chunks (-1 = unlimited past).",
+        default=16,
+        help="Streaming left-context window in chunks (16 = 5.1 s at chunk 8). "
+        "Bounds the inference cache and keeps rotary distances in the trained "
+        "range; -1 = unlimited past (not recommended for live streams).",
     )
     p.add_argument(
         "--right_context_chunks",
         type=int,
         default=0,
-        help="Streaming right-context (lookahead) in chunks. Adds 1-chunk "
-        "attention lookahead per chunk (latency += right_context_chunks chunks). "
-        "Since lookahead compounds with depth, the model is trained with this "
-        "streaming mask so train=inference. 0 = strictly causal (no lookahead).",
+        choices=[0, 1],
+        help="Streaming right-context (lookahead): 1 adds one chunk of hard-copied "
+        "(Emformer-style) lookahead, so latency = 2 chunks; the training forward "
+        "is then exactly the chunked inference computation (~2x encoder cost). "
+        "0 = strictly causal, latency = 1 chunk.",
     )
     p.add_argument(
         "--kd_alpha",
@@ -178,7 +181,11 @@ def main():
             print(f"Warm-started streaming student from {args.init_from}")
         lat_ms = args.chunk_size * 40
         rc_ms = args.right_context_chunks * lat_ms
-        lc = "unlimited" if args.left_context_chunks < 0 else f"{args.left_context_chunks} chunks"
+        lc = (
+            "unlimited"
+            if args.left_context_chunks < 0
+            else f"{args.left_context_chunks} chunks"
+        )
         print(
             f"Streaming: chunk={args.chunk_size} frames (~{lat_ms} ms), "
             f"left context {lc}, right context {args.right_context_chunks} chunks "

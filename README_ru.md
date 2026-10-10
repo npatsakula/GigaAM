@@ -126,6 +126,34 @@ emotion2prob = model.get_probs(audio_path)
 print(", ".join([f"{emotion}: {prob:.3f}" for emotion, prob in emotion2prob.items()]))
 ```
 
+### Потоковое распознавание
+
+Любая модель `_ctc` / `_rnnt` может работать в потоковом режиме (cache-aware streaming): каузальные свёртки и субдискретизация плюс блочное внимание по чанкам, без новых параметров. `gigaam.StreamingSession` принимает сырой PCM 16 кГц (моно) кусками любого размера по мере поступления, после каждого `push` возвращает текущую гипотезу и завершает поток по `finish()`. Результат совпадает с полным проходом потоковой модели по всей записи независимо от того, как было разбито аудио.
+
+```python
+import gigaam
+
+model = gigaam.load_model("v3_ctc")   # или чекпоинт потокового дообучения (настройки восстанавливаются)
+gigaam.enable_streaming(model, chunk_size=8, left_context_chunks=16, right_context_chunks=0)
+
+session = gigaam.StreamingSession(model, word_timestamps=True)
+for pcm in audio_source():            # float32 в [-1, 1] или int16, моно, 16 кГц, любой длины
+    partial = session.push(pcm)
+    print(partial.text)
+result = session.finish()             # досчитывает последний чанк
+for word in result.words:
+    print(f"  [{word.start:.2f} - {word.end:.2f}] {word.text}")
+
+# то же самое из файла, подаваемого кусками по 100 мс
+print(model.transcribe_streaming(audio_path, word_timestamps=True))
+```
+
+* `chunk_size` задаётся в кадрах энкодера по 40 мс; токен выдаётся, как только его чанк заполнен, поэтому алгоритмическая задержка равна `chunk_size * 40 мс` (по умолчанию 320 мс), см. `session.latency_seconds`.
+* `left_context_chunks` ограничивает окно внимания в прошлое (16 чанков = 5.1 с), а значит и стоимость чанка, и размер кэша: сессия может работать неограниченно долго. `-1` (без ограничения) заставляет стоимость и память расти с длиной потока.
+* `right_context_chunks=1` даёт каждому чанку один чанк заглядывания вперёд (жёсткая копия в стиле Emformer); задержка удваивается. Обучающий проход в точности совпадает с чанковым инференсом на любой глубине, рассогласования train/inference нет.
+* Базовая модель после `enable_streaming` работает потоково, но с худшим качеством: её веса не видели каузальных свёрток и блочного внимания. Для продакшена дообучите модель в потоковом режиме: `train_utils/train.py --streaming --chunk_size 8 --left_context_chunks 16 [--right_context_chunks 1] [--kd_alpha 0.5]` дистиллирует офлайн-модель в потоковую; чекпоинт восстанавливает потоковый режим при `load_model`. `train_utils/eval_streaming.py` считает разрыв между потоковой и офлайн-моделью и RTF.
+* Сессия обрабатывает один поток (batch size 1); на каждый поток создавайте свою сессию. FP8-квантование совместимо с потоковым режимом (сначала `enable_streaming`, затем `gigaam.fp8.quantize_model`).
+
 ### Дообучение моделей
 
 CTC и RNNT модели можно дообучать на собственных данных с помощью PyTorch Lightning. Подробное описание всех аргументов обучения — в [`train_utils/README.md`](./train_utils/README.md). Примеры с разными ограничениями VRAM доступны в [`train_utils/example.ipynb`](./train_utils/example.ipynb).

@@ -70,6 +70,11 @@ Homepage = "https://github.com/salute-developers/GigaAM/"
 [tool.setuptools.packages.find]
 include = ["gigaam"]
 
+[tool.pytest.ini_options]
+markers = [
+    "partial: downloads and runs real checkpoints",
+]
+
 [tool.black]
 line-length = 88
 

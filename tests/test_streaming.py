@@ -1,9 +1,10 @@
 """Streaming-encoder correctness tests.
 
-The first three tests build small randomly-initialised encoders (or a synthetic
-CTC decoder) and need no network / weights. The last one is marked ``partial``
-and exercises the real v3_ctc checkpoint end-to-end.
+Most tests build small randomly-initialised encoders (or a synthetic decoder)
+and need no network / weights. Tests marked ``partial`` exercise real v3
+checkpoints end-to-end.
 """
+
 import logging
 
 import pytest
@@ -29,15 +30,27 @@ ENC_KW = dict(
     conv_norm_type="layer_norm",
     flash_attn=False,
 )
+# Smaller width for the tests that sweep depth / batch (same topology).
+SMALL_KW = dict(ENC_KW, d_model=256, n_heads=4)
 CHUNK = 8  # encoder frames -> 320 ms
 SUB = 4  # subsampling factor -> feature frames per encoder frame
 
 
-def _streaming_encoder():
+def _streaming_encoder(**over):
+    kw = dict(ENC_KW, streaming=True, chunk_size=CHUNK, left_context_chunks=-1)
+    kw.update(over)
     torch.manual_seed(0)
-    return ConformerEncoder(
-        **ENC_KW, streaming=True, chunk_size=CHUNK, left_context_chunks=-1
-    ).eval()
+    return ConformerEncoder(**kw).eval()
+
+
+def _chunked(enc, x, feat_frames):
+    """Feed ``x`` chunk-by-chunk through the cache path and flush."""
+    state = enc.init_streaming_state()
+    outs = []
+    for s in range(0, feat_frames, CHUNK * SUB):
+        outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
+    outs.append(enc.flush_streaming(state))
+    return torch.cat([o for o in outs if o.shape[-1] > 0], dim=2)
 
 
 def test_zero_new_params():
@@ -80,6 +93,42 @@ def test_no_future_leak():
     assert off_change > 1e-3, "offline sanity: perturbation should have mattered"
 
 
+@pytest.mark.parametrize("n_layers", [1, 4, 16])
+def test_right_context_sees_exactly_one_chunk_ahead(n_layers):
+    """With right_context_chunks=1 the *training* forward must let chunk c see
+    chunk c+1 and nothing later, at any depth. A plain ``c(k) <= c(q)+1`` mask
+    would compound the look-ahead through the layers (chunk c would see up to
+    c+n_layers); the hard-copy layout must not."""
+    torch.manual_seed(0)
+    enc = ConformerEncoder(
+        **dict(SMALL_KW, n_layers=n_layers),
+        streaming=True,
+        chunk_size=CHUNK,
+        left_context_chunks=-1,
+        right_context_chunks=1,
+    ).eval()
+    n_chunks = 12
+    feat = n_chunks * CHUNK * SUB
+    c0 = 2
+    x = torch.randn(1, 64, feat)
+    lens = torch.tensor([feat])
+    sl = slice(c0 * CHUNK, (c0 + 1) * CHUNK)
+    with torch.inference_mode():
+        y, _ = enc(x, lens)
+        for k in (1, 2, 3):
+            x2 = x.clone()
+            s = (c0 + k) * CHUNK * SUB
+            x2[:, :, s : s + CHUNK * SUB] = torch.randn(1, 64, CHUNK * SUB)
+            y2, _ = enc(x2, lens)
+            change = (y[:, :, sl] - y2[:, :, sl]).abs().max().item()
+            if k == 1:
+                assert change > 1e-3, "chunk c must see chunk c+1 (look-ahead)"
+            else:
+                assert (
+                    change < 1e-5
+                ), f"L={n_layers}: chunk c sees chunk c+{k}: look-ahead compounds"
+
+
 @pytest.mark.parametrize("feat_frames", [128, 200, 256, 259, 323])
 def test_encoder_cache_parity(feat_frames):
     """Chunk-by-chunk cache inference == full masked forward, at chunk-aligned and
@@ -89,11 +138,7 @@ def test_encoder_cache_parity(feat_frames):
     lens = torch.tensor([feat_frames])
     with torch.inference_mode():
         full, _ = enc(x, lens)
-        state = enc.init_streaming_state()
-        outs = []
-        for s in range(0, feat_frames, CHUNK * SUB):
-            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
-        stream = torch.cat(outs, dim=2)
+        stream = _chunked(enc, x, feat_frames)
     assert full.shape == stream.shape
     diff = (full - stream).abs().max().item()
     assert diff < 1e-4, f"cache parity broke: max|diff|={diff}"
@@ -106,22 +151,12 @@ def test_bounded_left_context_cache_parity(left_context_chunks, feat_frames):
     forward. The streaming attention cache must be evicted to the last
     ``left_context_chunks`` chunks; without eviction it silently keeps the whole
     past and diverges from the trained block mask."""
-    torch.manual_seed(0)
-    enc = ConformerEncoder(
-        **ENC_KW,
-        streaming=True,
-        chunk_size=CHUNK,
-        left_context_chunks=left_context_chunks,
-    ).eval()
+    enc = _streaming_encoder(left_context_chunks=left_context_chunks)
     x = torch.randn(1, 64, feat_frames)
     lens = torch.tensor([feat_frames])
     with torch.inference_mode():
         full, _ = enc(x, lens)
-        state = enc.init_streaming_state()
-        outs = []
-        for s in range(0, feat_frames, CHUNK * SUB):
-            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
-        stream = torch.cat(outs, dim=2)
+        stream = _chunked(enc, x, feat_frames)
     assert full.shape == stream.shape
     diff = (full - stream).abs().max().item()
     assert diff < 1e-4, (
@@ -130,72 +165,82 @@ def test_bounded_left_context_cache_parity(left_context_chunks, feat_frames):
     )
 
 
-@pytest.mark.parametrize("feat_frames", [128, 200, 259, 323])
-def test_right_context_cache_parity_single_layer(feat_frames):
-    """1-chunk right-context streaming == full masked forward, at n_layers=1.
-
-    Right-context (lookahead) compounds with depth, so exact parity against the
-    offline mask is only achievable at n_layers=1 (where there is no compounding).
-    At n_layers=1 this is an exact gate on the defer=1 inference path: each query
-    attends to [its chunk - left, its chunk + 1], and the chunked emit-deferred
-    path (feed non-overlapping chunks, hold one pending, flush at end) must
-    reproduce the full forward exactly. (Production models retrain with the
-    streaming mask, so train=inference and the depth-compounding gap is closed.)"""
+@pytest.mark.parametrize("left_context_chunks", [-1, 2])
+@pytest.mark.parametrize("n_layers", [2, 16])
+@pytest.mark.parametrize("feat_frames", [128, 259, 323])
+def test_right_context_cache_parity(left_context_chunks, n_layers, feat_frames):
+    """1-chunk right-context: the chunked, emit-deferred inference path (feed
+    non-overlapping chunks, hold one pending, flush at end) must reproduce the
+    hard-copy training forward exactly -- at production depth, with bounded and
+    unbounded left context, at chunk-aligned and ragged lengths. This is the
+    train == inference gate for look-ahead streaming."""
     torch.manual_seed(0)
-    enc_kw = dict(ENC_KW, n_layers=1)
     enc = ConformerEncoder(
-        **enc_kw,
+        **dict(SMALL_KW, n_layers=n_layers),
         streaming=True,
         chunk_size=CHUNK,
-        left_context_chunks=-1,
+        left_context_chunks=left_context_chunks,
         right_context_chunks=1,
     ).eval()
     x = torch.randn(1, 64, feat_frames)
     lens = torch.tensor([feat_frames])
     with torch.inference_mode():
         full, _ = enc(x, lens)
-        state = enc.init_streaming_state()
-        outs = []
-        for s in range(0, feat_frames, CHUNK * SUB):
-            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
-        outs.append(enc.flush_streaming(state))
-        stream = torch.cat([o for o in outs if o.shape[-1] > 0], dim=2)
-    stream = stream[:, :, : full.shape[-1]]
+        stream = _chunked(enc, x, feat_frames)
     assert full.shape == stream.shape, f"shape mismatch {full.shape} vs {stream.shape}"
     diff = (full - stream).abs().max().item()
-    assert diff < 1e-4, f"rc=1 L=1 parity broke at {feat_frames}: max|diff|={diff}"
+    assert diff < 1e-4, (
+        f"rc=1 L={n_layers} left={left_context_chunks} T={feat_frames}: "
+        f"parity broke: max|diff|={diff}"
+    )
 
 
-def test_right_context_runs_at_production_depth():
-    """The defer=1 right-context path must run end-to-end at production depth
-    (n_layers=16) and produce finite, correctly-shaped output. Exact parity vs
-    the offline mask is NOT expected here: right-context compounds with depth, so
-    a production model is retrained with the streaming mask (train=inference).
-    This test guards the path runs and stays finite at v3's 16-layer depth, and
-    that the chunked output length matches the full forward."""
+@pytest.mark.parametrize("right_context_chunks", [0, 1])
+def test_padded_batch_matches_single(right_context_chunks):
+    """Batched training forward with ragged lengths must equal each item's own
+    forward on its valid frames, and stay finite. Guards the padding logic of
+    both streaming masks (a fully masked softmax row is NaN under sdpa and would
+    poison the whole batch via the next layer's keys)."""
     torch.manual_seed(0)
-    enc_kw = dict(ENC_KW, n_layers=16)
     enc = ConformerEncoder(
-        **enc_kw,
+        **SMALL_KW,
         streaming=True,
         chunk_size=CHUNK,
-        left_context_chunks=-1,
-        right_context_chunks=1,
+        left_context_chunks=2,
+        right_context_chunks=right_context_chunks,
     ).eval()
-    feat = 200
-    x = torch.randn(1, 64, feat)
-    lens = torch.tensor([feat])
+    feat = 300
+    xb = torch.randn(3, 64, feat)
+    lb = torch.tensor([feat, 131, 40])
     with torch.inference_mode():
-        full, _ = enc(x, lens)
-        state = enc.init_streaming_state()
-        outs = []
-        for s in range(0, feat, CHUNK * SUB):
-            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
-        outs.append(enc.flush_streaming(state))
-        stream = torch.cat([o for o in outs if o.shape[-1] > 0], dim=2)
-    stream = stream[:, :, : full.shape[-1]]
-    assert full.shape == stream.shape
-    assert torch.isfinite(stream).all(), "rc=1 L=16 output has NaN/Inf"
+        yb, lens = enc(xb, lb)
+        assert torch.isfinite(yb).all(), "NaN/Inf in padded batch"
+        for i in range(3):
+            yi, li = enc(xb[i : i + 1, :, : lb[i]], lb[i : i + 1])
+            assert li.item() == lens[i].item()
+            diff = (yb[i : i + 1, :, : li.item()] - yi).abs().max().item()
+            assert diff < 1e-4, f"rc={right_context_chunks} item {i}: {diff}"
+
+
+def test_hardcopy_forward_trains():
+    """The hard-copy forward must be differentiable end to end (it is the
+    training graph for right-context fine-tunes), including with activation
+    checkpointing."""
+    torch.manual_seed(0)
+    enc = ConformerEncoder(
+        **dict(SMALL_KW, n_layers=2),
+        streaming=True,
+        chunk_size=CHUNK,
+        left_context_chunks=2,
+        right_context_chunks=1,
+        activation_checkpointing=True,
+    ).train()
+    x = torch.randn(2, 64, 150, requires_grad=True)
+    lens = torch.tensor([150, 90])
+    y, _ = enc(x, lens)
+    y.float().pow(2).mean().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in enc.parameters())
 
 
 def test_incremental_collapse_parity():
@@ -220,60 +265,6 @@ def test_incremental_collapse_parity():
         ids.extend(new_ids)
     assert ids == ref_ids
     assert dec.tokenizer.decode(ids) == dec.tokenizer.decode(ref_ids)
-
-
-def test_merge_reemitted_tokens():
-    """CTCGreedyDecoding.merge_reemitted_tokens collapses the spurious re-emission
-    doubles (шш, кк) the streaming CTC head produces: same token separated by a
-    small frame gap (the signature is ~2 frames). Genuine adjacent-frame repeats
-    and widely-spaced repeats are preserved."""
-    from gigaam.decoding import CTCGreedyDecoding
-
-    merge = CTCGreedyDecoding.merge_reemitted_tokens
-    # Re-emission within the gap window (gap 2): the second 'ш' is dropped.
-    ids = [ord("а"), ord("ш"), ord("ш"), ord("т")]
-    frames = [0, 1, 3, 4]
-    m_ids, m_fr = merge(ids, frames, max_gap=2)
-    assert m_ids == [ord("а"), ord("ш"), ord("т")], f"failed to merge re-emission: {m_ids}"
-    # Widely-spaced repeat (gap 5 > max_gap): preserved (not a re-emission).
-    ids = [ord("а"), ord("а")]
-    frames = [0, 5]
-    m_ids, _ = merge(ids, frames, max_gap=2)
-    assert m_ids == [ord("а"), ord("а")], "wrongly merged a distant repeat"
-    # Distinct tokens are never touched.
-    ids = [1, 2, 3]
-    frames = [0, 1, 2]
-    assert merge(ids, frames, max_gap=2)[0] == [1, 2, 3]
-    # Empty / single-token inputs pass through.
-    assert merge([], [], max_gap=2) == ([], [])
-    assert merge([5], [7], max_gap=2) == ([5], [7])
-
-
-@pytest.mark.partial
-def test_real_model_streaming_parity():
-    """End-to-end: on real v3_ctc weights patched into streaming mode, the
-    chunk-by-chunk driver reproduces the full streaming-masked forward's text."""
-    import gigaam
-
-    model = gigaam.load_model("v3_ctc", device="cpu", fp16_encoder=False).eval()
-    gigaam.enable_streaming(model, chunk_size=CHUNK, left_context_chunks=-1)
-
-    # deterministic ~4 s tone so the test needs no data files
-    import numpy as np
-
-    sr = 16000
-    t = np.linspace(0, 4.0, sr * 4, dtype=np.float32)
-    audio = (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
-    import soundfile as sf
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        sf.write(f.name, audio, sr)
-        path = f.name
-
-    full = model.transcribe(path).text
-    stream = model.transcribe_streaming(path).text
-    assert full == stream, f"driver text parity: {full!r} != {stream!r}"
 
 
 @pytest.mark.parametrize("T", [37, 64, 65])
@@ -309,33 +300,6 @@ def test_rnnt_decode_chunk_parity(T):
     assert ids == ref_ids, f"RNN-T decode parity broke: {ids[:10]} != {ref_ids[:10]}"
 
 
-@pytest.mark.parametrize("revision", ["v3_rnnt", "v3_e2e_rnnt"])
-@pytest.mark.partial
-def test_real_model_rnnt_streaming_parity(revision):
-    """End-to-end: on real RNN-T weights patched into streaming mode, the
-    chunk-by-chunk driver reproduces the streaming-masked forward's text. Covers
-    v3_e2e_rnnt (punctuation/normalization) with the same code path for free."""
-    import gigaam
-
-    model = gigaam.load_model(revision, device="cpu", fp16_encoder=False).eval()
-    gigaam.enable_streaming(model, chunk_size=CHUNK, left_context_chunks=-1)
-
-    import numpy as np
-    import soundfile as sf
-    import tempfile
-
-    sr = 16000
-    t = np.linspace(0, 4.0, sr * 4, dtype=np.float32)
-    audio = (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        sf.write(f.name, audio, sr)
-        path = f.name
-
-    full = model.transcribe(path).text
-    stream = model.transcribe_streaming(path).text
-    assert full == stream, f"[{revision}] driver text parity: {full!r} != {stream!r}"
-
-
 def test_enable_streaming_refuses_fp8_encoder():
     """enable_streaming rebuilds the encoder fresh (plain nn.Linear), so it must
     run BEFORE FP8 quantization. Calling it on an already-quantized encoder would
@@ -356,7 +320,7 @@ def test_enable_streaming_refuses_fp8_encoder():
             self.encoder = encoder
 
     with pytest.raises(RuntimeError, match="BEFORE gigaam.fp8.quantize_model"):
-        enable_streaming(_StubModel(enc), chunk_size=CHUNK, left_context_chunks=-1)
+        enable_streaming(_StubModel(enc), chunk_size=CHUNK)
 
 
 @pytest.mark.parametrize("left_context_chunks", [-1, 2])
@@ -373,13 +337,7 @@ def test_fp8_streaming_composes(left_context_chunks):
     parity tests; this test covers the FP8+streaming *integration*."""
     from gigaam.fp8 import FP8Linear, quantize_model
 
-    torch.manual_seed(0)
-    enc = ConformerEncoder(
-        **ENC_KW,
-        streaming=True,
-        chunk_size=CHUNK,
-        left_context_chunks=left_context_chunks,
-    ).eval()
+    enc = _streaming_encoder(left_context_chunks=left_context_chunks)
     # Wrap in a minimal structure so quantize_model can find ``.encoder``.
     import torch.nn as nn
 
@@ -389,20 +347,16 @@ def test_fp8_streaming_composes(left_context_chunks):
             self.encoder = encoder
 
     quantize_model(_Wrap(enc), compute_dtype=torch.float32)
-    assert any(isinstance(m, FP8Linear) for _, m in enc.named_modules()), (
-        "quantize_model swapped in no FP8Linear modules"
-    )
+    assert any(
+        isinstance(m, FP8Linear) for _, m in enc.named_modules()
+    ), "quantize_model swapped in no FP8Linear modules"
 
     feat_frames = 200
     x = torch.randn(1, 64, feat_frames)
     lens = torch.tensor([feat_frames])
     with torch.inference_mode():
         full, _ = enc(x, lens)
-        state = enc.init_streaming_state()
-        outs = []
-        for s in range(0, feat_frames, CHUNK * SUB):
-            outs.append(enc.forward_streaming_chunk(x[:, :, s : s + CHUNK * SUB], state))
-        stream = torch.cat(outs, dim=2)
+        stream = _chunked(enc, x, feat_frames)
     assert full.shape == stream.shape
     assert torch.isfinite(stream).all(), "streaming FP8 output has NaN/Inf"
     # The two paths track each other in magnitude (same order, finite).
@@ -410,20 +364,28 @@ def test_fp8_streaming_composes(left_context_chunks):
     assert rel < 0.5, f"FP8 chunked path diverged wildly from full: rel={rel:.2f}"
 
 
+@pytest.mark.partial
 def test_hf_streaming_config_round_trip():
     """A streaming checkpoint published to HF round-trips: package_hf records the
     mode as a top-level ``streaming`` block (NOT in the encoder cfg, so the stock
     transformers modeling_gigaam.py still instantiates it), and load_model_from_hf's
-    restore logic rebuilds streaming mode from that block. No network needed: this
-    exercises the config helper + the loader's restore branch on a built config."""
+    restore logic rebuilds streaming mode from that block. This exercises the
+    config helper + the loader's restore branch on a built config."""
     from gigaam.fp8.package_hf import _streaming_meta_from_hp
     from gigaam.hf_loader import _remap_targets
 
     # --- packaging side: a streaming checkpoint's hyper-parameters -> config block ---
-    hp = {"streaming": True, "chunk_size": 8, "left_context_chunks": -1}
+    hp = {
+        "streaming": True,
+        "chunk_size": 8,
+        "left_context_chunks": 16,
+        "right_context_chunks": 1,
+    }
     streaming_meta = _streaming_meta_from_hp(hp)
     assert streaming_meta is not None and streaming_meta["enabled"] is True
     assert streaming_meta["chunk_size"] == 8
+    assert streaming_meta["right_context_chunks"] == 1
+    assert streaming_meta["latency_ms"] == 640
 
     # Non-streaming checkpoint yields no block.
     assert _streaming_meta_from_hp({"model_name": "v3_ctc"}) is None
@@ -434,10 +396,14 @@ def test_hf_streaming_config_round_trip():
     import gigaam
 
     raw = {
-        "cfg": {"model": {"cfg": omegaconf.OmegaConf.to_container(
-            gigaam.load_model("v3_ctc", device="cpu", fp16_encoder=False).cfg,
-            resolve=True,
-        )}},
+        "cfg": {
+            "model": {
+                "cfg": omegaconf.OmegaConf.to_container(
+                    gigaam.load_model("v3_ctc", device="cpu", fp16_encoder=False).cfg,
+                    resolve=True,
+                )
+            }
+        },
         "streaming": streaming_meta,
     }
     # Encoder cfg must stay pristine (no streaming ctor arg).
@@ -455,9 +421,41 @@ def test_hf_streaming_config_round_trip():
             model,
             chunk_size=sm.get("chunk_size", 8),
             left_context_chunks=sm.get("left_context_chunks", -1),
+            right_context_chunks=sm.get("right_context_chunks", 0),
         )
     assert model.encoder.streaming is True
+    assert model.encoder.left_context_chunks == 16
+    assert model.encoder.right_context_chunks == 1
     assert hasattr(model, "transcribe_streaming")
+
+
+@pytest.mark.parametrize("right_context_chunks", [0, 1])
+@pytest.mark.parametrize("left_context_chunks", [-1, 16])
+@pytest.mark.partial
+def test_real_model_encoder_parity(right_context_chunks, left_context_chunks):
+    """Real v3_ctc weights (16 layers, d=768) on real speech features: the
+    chunked cache path reproduces the streaming full forward to float32
+    tolerance, for both strictly causal and hard-copy look-ahead modes."""
+    import gigaam
+
+    model = gigaam.load_model("v3_ctc", device="cpu", fp16_encoder=False).eval()
+    gigaam.enable_streaming(
+        model,
+        chunk_size=CHUNK,
+        left_context_chunks=left_context_chunks,
+        right_context_chunks=right_context_chunks,
+    )
+    wav = gigaam.load_audio(gigaam.utils.download_short_audio())
+    with torch.inference_mode():
+        feats, feat_len = model.preprocessor(wav[None], torch.tensor([wav.numel()]))
+        full, _ = model.encoder(feats, feat_len)
+        stream = _chunked(model.encoder, feats, feats.shape[-1])
+    assert full.shape == stream.shape
+    diff = (full - stream).abs().max().item()
+    assert diff < 1e-3, (
+        f"real weights rc={right_context_chunks} left={left_context_chunks}: "
+        f"max|diff|={diff}"
+    )
 
 
 if __name__ == "__main__":

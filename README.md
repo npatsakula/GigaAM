@@ -127,6 +127,34 @@ emotion2prob = model.get_probs(audio_path)
 print(", ".join([f"{emotion}: {prob:.3f}" for emotion, prob in emotion2prob.items()]))
 ```
 
+### Streaming inference
+
+Every `_ctc` / `_rnnt` model can run as a cache-aware streaming model: causal subsampling and convolutions plus chunked attention, with no new parameters. `gigaam.StreamingSession` takes raw 16 kHz mono PCM in pieces of any size as it arrives, returns the running hypothesis after every push and finalizes on `finish()`. The result is identical to the streaming model's full forward over the whole utterance, however the audio was split.
+
+```python
+import gigaam
+
+model = gigaam.load_model("v3_ctc")   # or a streaming fine-tune checkpoint (restores its settings)
+gigaam.enable_streaming(model, chunk_size=8, left_context_chunks=16, right_context_chunks=0)
+
+session = gigaam.StreamingSession(model, word_timestamps=True)
+for pcm in audio_source():            # float32 in [-1, 1] or int16, mono, 16 kHz, any length
+    partial = session.push(pcm)
+    print(partial.text)
+result = session.finish()             # flushes the last chunk
+for word in result.words:
+    print(f"  [{word.start:.2f} - {word.end:.2f}] {word.text}")
+
+# the same through a file, pushed in 100 ms pieces
+print(model.transcribe_streaming(audio_path, word_timestamps=True))
+```
+
+* `chunk_size` is in encoder frames of 40 ms; a token is emitted once its chunk is complete, so the algorithmic latency is `chunk_size * 40 ms` (320 ms by default), see `session.latency_seconds`.
+* `left_context_chunks` bounds the attention window into the past (16 chunks = 5.1 s). It bounds the per-chunk cost and the cache, so a session can run indefinitely. `-1` (unlimited) makes cost and memory grow with the stream.
+* `right_context_chunks=1` lets every chunk attend to one chunk of look-ahead (Emformer-style hard copy); latency doubles. The training forward is exactly the chunked inference computation, so there is no train/inference mismatch at any depth.
+* A base model patched with `enable_streaming` streams correctly but with reduced accuracy, because its weights never saw causal convolutions or chunked attention. Fine-tune in streaming mode for production quality: `train_utils/train.py --streaming --chunk_size 8 --left_context_chunks 16 [--right_context_chunks 1] [--kd_alpha 0.5]` distills the offline model into the streaming one; the checkpoint then restores streaming mode on `load_model`. `train_utils/eval_streaming.py` reports the streaming-vs-offline gap and real-time factor.
+* Sessions are single-stream (batch size 1); run one session per stream. FP8 quantization composes with streaming (`enable_streaming` first, then `gigaam.fp8.quantize_model`).
+
 ### Model Fine-tuning
 
 Both CTC and RNNT models can be fine-tuned on custom data using PyTorch Lightning. For a detailed description of all training arguments, see [`train_utils/README.md`](./train_utils/README.md). End-to-end examples with different VRAM constraints are available in [`train_utils/example.ipynb`](./train_utils/example.ipynb).

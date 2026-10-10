@@ -11,13 +11,13 @@ Example:
         --manifest /data/golos/manifest_val.tsv \
         --limit 500
 """
+
 import argparse
 import csv
 import time
 from pathlib import Path
 
 import editdistance
-import torch
 
 import gigaam
 
@@ -43,11 +43,28 @@ def parse_args() -> argparse.Namespace:
         help="Fine-tuned streaming .ckpt, or a base model name to eval zero-shot "
         "(will be patched with enable_streaming).",
     )
-    p.add_argument("--offline", default="v3_e2e_ctc", help="Offline teacher/reference model")
+    p.add_argument(
+        "--offline", default="v3_e2e_ctc", help="Offline teacher/reference model"
+    )
     p.add_argument("--manifest", required=True)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--device", default=None)
-    p.add_argument("--chunk_size", type=int, default=8, help="Only for zero-shot patching")
+    p.add_argument(
+        "--chunk_size", type=int, default=8, help="Only for zero-shot patching"
+    )
+    p.add_argument(
+        "--left_context_chunks",
+        type=int,
+        default=16,
+        help="Only for zero-shot patching",
+    )
+    p.add_argument(
+        "--right_context_chunks",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Only for zero-shot patching",
+    )
     p.add_argument(
         "--from_hf",
         action="store_true",
@@ -71,7 +88,12 @@ def main() -> None:
         )
     else:  # zero-shot: patch a base model into streaming mode
         stream_model = load(args.streaming_ckpt, device=args.device, fp16_encoder=False)
-        gigaam.enable_streaming(stream_model, chunk_size=args.chunk_size)
+        gigaam.enable_streaming(
+            stream_model,
+            chunk_size=args.chunk_size,
+            left_context_chunks=args.left_context_chunks,
+            right_context_chunks=args.right_context_chunks,
+        )
     stream_model.eval()
     assert getattr(stream_model.encoder, "streaming", False), "not a streaming model"
 
@@ -112,15 +134,17 @@ def main() -> None:
 
     print(f"n={len(rows)}")
     print(
-        f"RESTORATION GAP (streaming vs offline) WER: {100*gap_e/max(gap_w,1):.2f}%   "
-        f"CER: {100*gap_cer_e/max(gap_cer_n,1):.2f}%"
+        f"RESTORATION GAP (streaming vs offline) WER: {100 * gap_e / max(gap_w, 1):.2f}%   "
+        f"CER: {100 * gap_cer_e / max(gap_cer_n, 1):.2f}%"
     )
     if abs_w:
         print(
-            f"absolute vs dataset                         WER: {100*abs_e/max(abs_w,1):.2f}%   "
-            f"CER: {100*abs_cer_e/max(abs_cer_n,1):.2f}%"
+            f"absolute vs dataset                         WER: {100 * abs_e / max(abs_w, 1):.2f}%   "
+            f"CER: {100 * abs_cer_e / max(abs_cer_n, 1):.2f}%"
         )
-    print(f"RTF (streaming compute / audio):            {infer_s/max(audio_s,1e-9):.3f}")
+    print(
+        f"RTF (streaming compute / audio):            {infer_s / max(audio_s, 1e-9):.3f}"
+    )
 
 
 if __name__ == "__main__":

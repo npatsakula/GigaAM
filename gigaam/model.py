@@ -1,4 +1,3 @@
-import contextlib
 from typing import Dict, List, Optional, Tuple
 
 import hydra
@@ -17,19 +16,30 @@ LONGFORM_THRESHOLD = 25 * SAMPLE_RATE
 def enable_streaming(
     model: "GigaAM",
     chunk_size: int = 8,
-    left_context_chunks: int = -1,
+    left_context_chunks: int = 16,
     right_context_chunks: int = 0,
 ) -> "GigaAM":
     """
     Rebuild ``model.encoder`` in streaming mode (chunked block attention + causal
     subsampling/convs) in place, preserving weights. Streaming adds no parameters,
-    so the existing encoder state_dict loads strict. ``chunk_size`` is in encoder
-    frames (40 ms each; 8 = 320 ms latency); ``left_context_chunks=-1`` means
-    unlimited past. ``right_context_chunks>0`` adds 1-chunk lookahead attention
-    (latency += ``right_context_chunks`` chunks); since lookahead compounds with
-    depth the model must be (re)trained in streaming mode for usable quality.
-    Records the config on ``model.cfg.encoder`` so it round-trips through
-    checkpoints.
+    so the existing encoder state_dict loads strict. Records the config on
+    ``model.cfg.encoder`` so it round-trips through checkpoints.
+
+    ``chunk_size`` is in encoder frames (40 ms each; 8 = 320 ms of audio per
+    chunk). ``left_context_chunks`` bounds the attention window into the past
+    (16 chunks = 5.1 s at chunk 8); it bounds the streaming cache and per-chunk
+    cost and keeps rotary distances inside the trained range. ``-1`` means
+    unlimited past: cost and memory then grow with stream length, and positions
+    extrapolate beyond training lengths on long streams -- avoid it for live
+    use. ``right_context_chunks=1`` adds one chunk of hard-copied look-ahead
+    (Emformer style): latency doubles to two chunks, and the training forward
+    is exactly the chunked inference computation (no depth compounding).
+
+    A base (offline) model patched this way streams correctly but with degraded
+    accuracy, because its weights never saw causal convs or chunked attention.
+    Fine-tune in streaming mode (``train_utils/train.py --streaming``) for
+    production quality; the fine-tune's checkpoint restores these settings on
+    load.
 
     Order matters with FP8 quantization: this rebuilds the encoder fresh from
     ``cfg.encoder`` (plain ``nn.Linear``), so it must run *before*
@@ -43,7 +53,7 @@ def enable_streaming(
     try:
         from .fp8.linear import FP8Linear
     except Exception:  # fp8 extras not installed -> nothing to guard against
-        FP8Linear = None  # type: ignore[assignment]
+        FP8Linear = None  # type: ignore[assignment,misc]
     if FP8Linear is not None:
         has_fp8 = any(
             isinstance(m, FP8Linear) for _, m in model.encoder.named_modules()
@@ -202,113 +212,29 @@ class GigaAMASR(GigaAM):
         return TranscriptionResult(text=text, words=words)
 
     @torch.inference_mode()
-    def transcribe_streaming(self, wav_file: str) -> TranscriptionResult:
+    def transcribe_streaming(
+        self,
+        wav_file: str,
+        word_timestamps: bool = False,
+        push_seconds: float = 0.1,
+    ) -> TranscriptionResult:
         """
-        Cache-aware streaming transcription (CTC and RNN-T models). Encodes the
-        audio chunk-by-chunk through the streaming encoder -- reproducing the
-        offline result within numerical tolerance -- and decodes incrementally
-        across chunk boundaries: CTC collapse for CTC models, a stateful
-        predictor+joint loop for RNN-T models (the predictor LSTM state and last
-        label thread across chunks). Requires a model loaded/fine-tuned in
-        streaming mode (``encoder.streaming``); see ``gigaam.enable_streaming``.
-
-        This reference driver preprocesses the whole file, then feeds fixed
-        feature blocks to emulate real-time arrival; a live driver would push
-        audio as it comes and keep a one-hop overlap for the ``center=False``
-        window. Output is identical either way.
+        Transcribe a file through the live streaming path: the audio is pushed
+        into a :class:`gigaam.streaming.StreamingSession` in ``push_seconds``
+        pieces, exactly as a microphone or socket would deliver it, and the
+        session's final result is returned. Requires a model in streaming mode
+        (a streaming fine-tune, or ``gigaam.enable_streaming``). Supports CTC and
+        RNN-T models. The result equals the streaming model's full forward over
+        the whole file, whatever ``push_seconds`` is.
         """
-        from .decoding import CTCGreedyDecoding, RNNTGreedyDecoding
+        from .streaming import StreamingSession
 
-        assert getattr(self.encoder, "streaming", False), (
-            "model is not in streaming mode; load a streaming fine-tune or call "
-            "gigaam.enable_streaming(model)"
-        )
-        is_ctc = isinstance(self.decoding, CTCGreedyDecoding)
-        is_rnnt = isinstance(self.decoding, RNNTGreedyDecoding)
-        assert is_ctc or is_rnnt, (
-            "transcribe_streaming supports CTC and RNN-T models only"
-        )
-
-        wav, length = self.prepare_wav(wav_file)
-        features, _ = self.preprocessor(wav.float(), length)  # [1, feat, T_feat]
-        enc_dtype = next(self.encoder.parameters()).dtype
-        head_dtype = next(self.head.parameters()).dtype
-        features = features.to(enc_dtype)
-
-        sub_factor = 2 ** self.encoder.pre_encode._sampling_num
-        feat_per_chunk = self.encoder.chunk_size * sub_factor
-
-        state = self.encoder.init_streaming_state()
-        t_feat = features.shape[-1]
-        ids: List[int] = []
-        frames: List[int] = []
-        last_label = self.decoding.blank_id
-        # RNN-T only: the predictor LSTM (h, c) carried across chunks. None on
-        # the first chunk so decode_chunk makes the fresh (blank-seeded) prediction.
-        dec_state = None
-        enc_frame = 0
-        # Mirror forward(): on GPU run the encoder under fp16 autocast (the encoder
-        # params are pre-halved when fp16_encoder=True, but the autocast context
-        # keeps fused/op behaviour identical to the offline path). On CPU the
-        # encoder runs in its native dtype with no autocast.
-        encoder_ctx = (
-            torch.autocast(device_type=self._device.type, dtype=torch.float16)
-            if self._device.type != "cpu"
-            else contextlib.nullcontext()
-        )
-        for s in range(0, t_feat, feat_per_chunk):
-            fc = features[:, :, s : s + feat_per_chunk]
-            with encoder_ctx:
-                enc_chunk = self.encoder.forward_streaming_chunk(fc, state)
-            enc_chunk = enc_chunk.to(head_dtype)
-            # With right_context_chunks>0 the encoder defers emission by one chunk,
-            # so the final iteration may return 0 frames (the last chunk is flushed
-            # after the loop). Skip the head/decode for zero-length chunks -- they
-            # produce no tokens and would crash the Conv1d head on a 0-size input.
-            if enc_chunk.shape[-1] == 0:
-                continue
-            if is_ctc:
-                log_probs = self.head(encoder_output=enc_chunk)  # [1, n, C]
-                new_ids, new_fr, last_label = self.decoding.decode_chunk(
-                    log_probs, last_label, enc_frame
-                )
-            else:  # is_rnnt
-                new_ids, new_fr, dec_state, last_label = self.decoding.decode_chunk(
-                    self.head, enc_chunk, dec_state, last_label, enc_frame
-                )
-            ids.extend(new_ids)
-            frames.extend(new_fr)
-            enc_frame += enc_chunk.shape[-1]
-
-        # Drain any final buffered chunk. With right_context_chunks>0 the encoder
-        # defers emission by one chunk, so the last chunk is held until flush; with
-        # right_context_chunks==0 flush is a no-op (returns an empty chunk). Empty
-        # chunks decode to nothing (the CTC/RNN-T chunk decoders skip zero-length).
-        with encoder_ctx:
-            enc_chunk = self.encoder.flush_streaming(state)
-        enc_chunk = enc_chunk.to(head_dtype)
-        if enc_chunk.shape[-1] > 0:
-            if is_ctc:
-                log_probs = self.head(encoder_output=enc_chunk)
-                new_ids, new_fr, last_label = self.decoding.decode_chunk(
-                    log_probs, last_label, enc_frame
-                )
-            else:  # is_rnnt
-                new_ids, new_fr, dec_state, last_label = self.decoding.decode_chunk(
-                    self.head, enc_chunk, dec_state, last_label, enc_frame
-                )
-            ids.extend(new_ids)
-            frames.extend(new_fr)
-
-        # CTC streaming/quantization can re-emit a token after a brief blank
-        # (spurious doubles like шш, кк -- a tight ~2-frame signature, see
-        # CTCGreedyDecoding.merge_reemitted_tokens). Collapse them before decode.
-        # RNN-T is unaffected (its predictor emits at most one token per step).
-        if is_ctc:
-            ids, frames = self.decoding.merge_reemitted_tokens(ids, frames)
-
-        text = self.decoding.tokenizer.decode(ids)
-        return TranscriptionResult(text=text, words=None)
+        session = StreamingSession(self, word_timestamps=word_timestamps)
+        wav = load_audio(wav_file)
+        step = max(1, int(push_seconds * SAMPLE_RATE))
+        for s in range(0, wav.numel(), step):
+            session.push(wav[s : s + step])
+        return session.finish()
 
     def forward_for_export(
         self, features: Tensor, feature_lengths: Tensor
