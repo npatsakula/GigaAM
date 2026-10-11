@@ -64,11 +64,6 @@ else
   EVAL_LIMIT="${EVAL_LIMIT:-}"
 fi
 
-case "$MODEL" in
-  *e2e*) TEXT_ARGS="" ;;
-  *)     TEXT_ARGS="--raw_text" ;;   # character-level vocab: strip punctuation/case
-esac
-
 has_stage() { [[ " $STAGES " == *" $1 "* ]]; }
 
 COMPILE_ARGS=""
@@ -83,56 +78,68 @@ if has_stage data; then
       --val_hours "$VAL_HOURS" ${TRAIN_HOURS:+--train_hours "$TRAIN_HOURS"}
 fi
 
-# ------------------------------------------------- 2. teacher pseudo-labels
-# The student is trained to restore the OFFLINE model, so its targets are the
-# teacher's own transcripts (plus the per-frame KL term in training).
-TRAIN_MANIFEST="$DATA_DIR/manifest_train.teacher.tsv"
-if has_stage pseudo; then
-  echo "== pseudo-label with offline $MODEL"
-  (cd train_utils && $PY pseudo_label.py --teacher "$MODEL" \
-      --in_manifest "$DATA_DIR/manifest_train.tsv" --out_manifest "$TRAIN_MANIFEST" \
-      --batch_seconds "$PSEUDO_SECONDS" --num_workers "$WORKERS")
-fi
-
-# ------------------------------------------------------------- 3. training
-config_args() {
-  case "$1" in
-    rc1_c8)  echo "--chunk_size 8  --right_context_chunks 1" ;;
-    rc0_c16) echo "--chunk_size 16 --right_context_chunks 0" ;;
-    rc0_c8)  echo "--chunk_size 8  --right_context_chunks 0" ;;
-    *) echo "unknown config $1" >&2; exit 1 ;;
+for MODEL in $MODELS; do
+  echo "#### model $MODEL"
+  case "$MODEL" in
+    *e2e*) TEXT_ARGS="" ;;
+    *)     TEXT_ARGS="--raw_text" ;;   # character-level vocab: strip punctuation/case
   esac
-}
+  case "$MODEL" in
+    *rnnt*) MODEL_ARGS="--rnnt_subbatch_size $RNNT_SUBBATCH" ;;  # joint logits [b,T,U,V] per sub-batch
+    *)      MODEL_ARGS="" ;;
+  esac
 
-if has_stage train; then
-  for cfg in $CONFIGS; do
-    EXP="stream_${MODEL}_${cfg}"
-    echo "== train $EXP"
-    (cd train_utils && $PY train.py \
-        --model_name "$MODEL" \
-        --train_manifest "$TRAIN_MANIFEST" \
-        --val_manifest "$DATA_DIR/manifest_val.tsv" \
-        --output_dir "$OUT_DIR" --exp_name "$EXP" \
-        --streaming $(config_args "$cfg") --left_context_chunks "$LEFT_CONTEXT" \
-        --kd_alpha "$KD_ALPHA" \
-        --batch_size "$BATCH" --batch_seconds "$BATCH_SECONDS" --eval_batch_size 64 \
-        --num_workers "$WORKERS" --precision bf16-mixed --accelerator "$ACCELERATOR" \
-        $COMPILE_ARGS \
-        --lr "$LR" --warmup_ratio 0.05 --gradient_clip_val 1.0 \
-        --skip_initial_validation --save_top_k 2 \
-        $TEXT_ARGS $TRAIN_ARGS)
-  done
-fi
+  # ------------------------------------------------- 2. teacher pseudo-labels
+  # The student is trained to restore the OFFLINE model, so its targets are the
+  # teacher's own transcripts (plus the per-frame KL term in training).
+  TRAIN_MANIFEST="$DATA_DIR/manifest_train.teacher_${MODEL}.tsv"
+  if has_stage pseudo; then
+    echo "== pseudo-label with offline $MODEL"
+    (cd train_utils && $PY pseudo_label.py --teacher "$MODEL" \
+        --in_manifest "$DATA_DIR/manifest_train.tsv" --out_manifest "$TRAIN_MANIFEST" \
+        --batch_seconds "$PSEUDO_SECONDS" --num_workers "$WORKERS")
+  fi
 
-# ----------------------------------------------------------------- 4. eval
-if has_stage eval; then
-  for cfg in $CONFIGS; do
-    EXP="stream_${MODEL}_${cfg}"
-    CKPT=$(ls -t "$OUT_DIR/models/$EXP"/*.ckpt 2>/dev/null | head -1 || true)
-    if [[ -z "$CKPT" ]]; then echo "no checkpoint for $EXP"; continue; fi
-    echo "== eval $EXP ($CKPT)"
-    (cd train_utils && $PY eval_streaming.py --streaming_ckpt "$CKPT" --offline "$MODEL" \
-        --manifest "$DATA_DIR/manifest_val.tsv" --batch_size 32 $EVAL_LIMIT)
-  done
-fi
+  # ------------------------------------------------------------- 3. training
+  config_args() {
+    case "$1" in
+      rc1_c8)  echo "--chunk_size 8  --right_context_chunks 1" ;;
+      rc0_c16) echo "--chunk_size 16 --right_context_chunks 0" ;;
+      rc0_c8)  echo "--chunk_size 8  --right_context_chunks 0" ;;
+      *) echo "unknown config $1" >&2; exit 1 ;;
+    esac
+  }
+
+  if has_stage train; then
+    for cfg in $CONFIGS; do
+      EXP="stream_${MODEL}_${cfg}"
+      echo "== train $EXP"
+      (cd train_utils && $PY train.py \
+          --model_name "$MODEL" \
+          --train_manifest "$TRAIN_MANIFEST" \
+          --val_manifest "$DATA_DIR/manifest_val.tsv" \
+          --output_dir "$OUT_DIR" --exp_name "$EXP" \
+          --streaming $(config_args "$cfg") --left_context_chunks "$LEFT_CONTEXT" \
+          --kd_alpha "$KD_ALPHA" \
+          --batch_size "$BATCH" --batch_seconds "$BATCH_SECONDS" --eval_batch_size 64 \
+          --num_workers "$WORKERS" --precision bf16-mixed --accelerator "$ACCELERATOR" \
+          $COMPILE_ARGS \
+          --lr "$LR" --warmup_ratio 0.05 --gradient_clip_val 1.0 \
+          --skip_initial_validation --save_top_k 2 \
+          $TEXT_ARGS $MODEL_ARGS $TRAIN_ARGS)
+    done
+  fi
+
+  # ----------------------------------------------------------------- 4. eval
+  if has_stage eval; then
+    for cfg in $CONFIGS; do
+      EXP="stream_${MODEL}_${cfg}"
+      CKPT=$(ls -t "$OUT_DIR/models/$EXP"/*.ckpt 2>/dev/null | head -1 || true)
+      if [[ -z "$CKPT" ]]; then echo "no checkpoint for $EXP"; continue; fi
+      echo "== eval $EXP ($CKPT)"
+      (cd train_utils && $PY eval_streaming.py --streaming_ckpt "$CKPT" --offline "$MODEL" \
+          --manifest "$DATA_DIR/manifest_val.tsv" --batch_size 32 $EVAL_LIMIT)
+    done
+  fi
+done
 echo "done"
