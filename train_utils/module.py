@@ -338,7 +338,8 @@ class GigaAMFineTuner(pl.LightningModule):
             [p for p in self.parameters() if p.requires_grad],
             lr=self._lr,
             weight_decay=self._wd,
-            fused=self.device.type == "cuda",  # one kernel per step, not per tensor
+            # Not fused=True: Lightning's AMP plugin refuses gradient clipping with
+            # a fused optimizer (it unscales internally). foreach is the default.
         )
         total = self.trainer.estimated_stepping_batches
         warmup = max(1, int(self._warmup_ratio * total))
