@@ -177,6 +177,16 @@ def download_long_audio() -> str:
     return audio_file
 
 
+class _CharEncoder:
+    """Character-level text -> token ids (characters outside the vocab are dropped)."""
+
+    def __init__(self, vocab):
+        self.c2i = {c: i for i, c in enumerate(vocab)}
+
+    def __call__(self, text: str) -> List[int]:
+        return [self.c2i[c] for c in text if c in self.c2i]
+
+
 class AudioDataset(torch.utils.data.Dataset):
     """
     Unified dataset class for training and inference.
@@ -220,8 +230,10 @@ class AudioDataset(torch.utils.data.Dataset):
             return None
 
         if getattr(tokenizer, "charwise", False):
-            c2i = {c: i for i, c in enumerate(tokenizer.vocab)}
-            return lambda text: [c2i[c] for c in text if c in c2i]
+            # A picklable callable (not a lambda): DataLoader workers pickle
+            # the dataset under the spawn/forkserver start methods (macOS,
+            # and Linux from Python 3.14).
+            return _CharEncoder(tokenizer.vocab)
 
         return tokenizer.model.encode
 
