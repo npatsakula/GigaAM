@@ -114,6 +114,7 @@ def main() -> None:
 
     gap_e = gap_w = abs_e = abs_w = 0
     gap_cer_e = gap_cer_n = abs_cer_e = abs_cer_n = 0
+    off_e = off_w = off_cer_e = off_cer_n = 0  # the offline model vs dataset text
     audio_s = infer_s = 0.0
     paths = [
         str(
@@ -163,6 +164,12 @@ def main() -> None:
             ce2, cn2 = cer(row["transcription"].lower(), hyp)
             abs_cer_e += ce2
             abs_cer_n += cn2
+            e3, w3 = wer(row["transcription"].lower(), ref_off)
+            off_e += e3
+            off_w += w3
+            ce3, cn3 = cer(row["transcription"].lower(), ref_off)
+            off_cer_e += ce3
+            off_cer_n += cn3
         if i < 5:
             print(f"OFF: {ref_off}\nSTR: {hyp}\n")
 
@@ -173,8 +180,12 @@ def main() -> None:
     )
     if abs_w:
         print(
-            f"absolute vs dataset                         WER: {100 * abs_e / max(abs_w, 1):.2f}%   "
+            f"absolute vs dataset (streaming)             WER: {100 * abs_e / max(abs_w, 1):.2f}%   "
             f"CER: {100 * abs_cer_e / max(abs_cer_n, 1):.2f}%"
+        )
+        print(
+            f"absolute vs dataset (offline, the ceiling)  WER: {100 * off_e / max(off_w, 1):.2f}%   "
+            f"CER: {100 * off_cer_e / max(off_cer_n, 1):.2f}%"
         )
     print(
         f"RTF (streaming compute / audio):            {infer_s / max(audio_s, 1e-9):.3f}"
