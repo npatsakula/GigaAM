@@ -37,6 +37,15 @@ def cer(ref: str, hyp: str) -> tuple[int, int]:
     return editdistance.eval(r, hyp.rstrip("\n")), max(len(r), 1)
 
 
+_PUNCT = str.maketrans("", "", ".,?!:;\"'«»()[]-–—")
+
+
+def normalize(text: str) -> str:
+    """Lowercase, drop punctuation and collapse whitespace: the acoustic
+    content of an e2e transcript without its formatting decisions."""
+    return " ".join(text.lower().replace("ё", "е").translate(_PUNCT).split())
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -115,6 +124,7 @@ def main() -> None:
     gap_e = gap_w = abs_e = abs_w = 0
     gap_cer_e = gap_cer_n = abs_cer_e = abs_cer_n = 0
     off_e = off_w = off_cer_e = off_cer_n = 0  # the offline model vs dataset text
+    ngap_e = ngap_w = ngap_cer_e = ngap_cer_n = 0  # gap after normalization
     audio_s = infer_s = 0.0
     paths = [
         str(
@@ -157,6 +167,13 @@ def main() -> None:
         ce, cn = cer(ref_off, hyp)
         gap_cer_e += ce
         gap_cer_n += cn
+        n_ref, n_hyp = normalize(ref_off), normalize(hyp)
+        ne, nw = wer(n_ref, n_hyp)
+        ngap_e += ne
+        ngap_w += nw
+        nce, ncn = cer(n_ref, n_hyp)
+        ngap_cer_e += nce
+        ngap_cer_n += ncn
         if "transcription" in row and row["transcription"]:
             e2, w2 = wer(row["transcription"].lower(), hyp)
             abs_e += e2
@@ -177,6 +194,10 @@ def main() -> None:
     print(
         f"RESTORATION GAP (streaming vs offline) WER: {100 * gap_e / max(gap_w, 1):.2f}%   "
         f"CER: {100 * gap_cer_e / max(gap_cer_n, 1):.2f}%"
+    )
+    print(
+        f"  same, lowercased / no punctuation          WER: {100 * ngap_e / max(ngap_w, 1):.2f}%   "
+        f"CER: {100 * ngap_cer_e / max(ngap_cer_n, 1):.2f}%   (acoustic errors only)"
     )
     if abs_w:
         print(
