@@ -137,6 +137,7 @@ def main() -> None:
     gap_cer_e = gap_cer_n = abs_cer_e = abs_cer_n = 0
     off_e = off_w = off_cer_e = off_cer_n = 0  # the offline model vs dataset text
     ngap_e = ngap_w = ngap_cer_e = ngap_cer_n = 0  # gap after normalization
+    nabs_e = nabs_w = noff_e = noff_w = 0  # normalized absolute, streaming / offline
     audio_s = infer_s = 0.0
     paths = [
         str(
@@ -200,6 +201,13 @@ def main() -> None:
             ce2, cn2 = cer(row["transcription"].lower(), hyp)
             abs_cer_e += ce2
             abs_cer_n += cn2
+            n_gt = normalize(row["transcription"])
+            e4, w4 = wer(n_gt, n_hyp)
+            nabs_e += e4
+            nabs_w += w4
+            e5, w5 = wer(n_gt, n_ref)
+            noff_e += e5
+            noff_w += w5
             e3, w3 = wer(row["transcription"].lower(), ref_off)
             off_e += e3
             off_w += w3
@@ -226,6 +234,12 @@ def main() -> None:
         print(
             f"absolute vs dataset (offline, the ceiling)  WER: {100 * off_e / max(off_w, 1):.2f}%   "
             f"CER: {100 * off_cer_e / max(off_cer_n, 1):.2f}%"
+        )
+        n_abs = 100 * nabs_e / max(nabs_w, 1)
+        n_off = 100 * noff_e / max(noff_w, 1)
+        print(
+            f"  normalized, vs dataset: streaming {n_abs:.2f}%  offline {n_off:.2f}%  "
+            f"-> streaming is {n_abs - n_off:+.2f} WER points ({100 * (n_abs / max(n_off, 1e-9) - 1):+.0f}% relative)"
         )
     print(
         f"RTF (streaming compute / audio):            {infer_s / max(audio_s, 1e-9):.3f}"
