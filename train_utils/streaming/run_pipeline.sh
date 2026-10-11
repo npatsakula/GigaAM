@@ -7,7 +7,9 @@
 #   STAGES="train eval" bash train_utils/streaming/run_pipeline.sh
 #
 # Tunables (environment variables, defaults in brackets):
-#   DATA_DIR   [./data/golos]      where WAVs + manifests go
+#   DATA_DIR   [./data/golos]      where WAVs + manifests go (full dataset: ~120 GB of WAV,
+#                                  plus ~16 GB of parquet cache in ~/.cache/huggingface that
+#                                  can be deleted once the data stage is done; TRAIN_HOURS caps it)
 #   OUT_DIR    [./checkpoints]     experiments (models/<exp>/..., tb logs)
 #   MODEL      [v3_e2e_ctc]        base model to convert (v3_ctc, v3_e2e_ctc, v3_rnnt, v3_e2e_rnnt)
 #   TRAIN_HOURS [all]              cap on training audio

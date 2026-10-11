@@ -7,7 +7,8 @@ are decoded, so memory stays flat however much of the dataset is requested.
 Validation is held out by whole shards (the last ones), so train and val never
 share a shard.
 
-Example (everything, ~16 GB download, ~33 GB of WAV):
+Example (everything: ~16 GB parquet download cached under ~/.cache/huggingface,
+~120 GB of 16 kHz 16-bit WAV written; the cache can be deleted afterwards):
 
     python prepare_golos.py --out_dir /data/golos --workers 16
 
