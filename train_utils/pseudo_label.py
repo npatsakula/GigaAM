@@ -16,7 +16,7 @@ Example:
         --teacher v3_e2e_ctc \\
         --in_manifest /data/golos/manifest_train.tsv \\
         --out_manifest /data/golos/manifest_train.teacher.tsv \\
-        --batch_size 64 --num_workers 16
+        --batch_seconds 2000 --num_workers 16
 """
 
 import argparse
@@ -38,7 +38,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher", default="v3_e2e_ctc", help="Offline teacher model name")
     p.add_argument("--in_manifest", required=True)
     p.add_argument("--out_manifest", required=True)
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=512,
+        help="Maximum clips per batch (the audio budget below usually binds first).",
+    )
+    p.add_argument(
+        "--batch_seconds",
+        type=float,
+        default=2000.0,
+        help="Audio seconds per batch. Batches are duration-sorted, so short clips "
+        "are grouped by the hundreds and every forward carries enough work to "
+        "fill the GPU; long clips form small batches automatically.",
+    )
     p.add_argument(
         "--num_workers",
         type=int,
@@ -80,19 +93,26 @@ def main() -> None:
         f"offline {args.teacher} on {dev} ..."
     )
 
-    # Duration-sorted batches (little padding); long clips alone.
+    # Duration-sorted batches (little padding) closed by an audio budget: the
+    # padded size is len(batch) * max duration, which the sort keeps close to
+    # the real audio. Long clips are decoded alone.
     batches: List[List[int]] = []
     cur: List[int] = []
     for i in sorted(range(len(ds)), key=durations.__getitem__):
         if durations[i] > args.max_batch_seconds:
             batches.append([i])
             continue
-        cur.append(i)
-        if len(cur) >= args.batch_size:
+        padded = (len(cur) + 1) * durations[i]  # sorted: this clip is the longest
+        if cur and (padded > args.batch_seconds or len(cur) >= args.batch_size):
             batches.append(cur)
             cur = []
+        cur.append(i)
     if cur:
         batches.append(cur)
+    print(
+        f"  {len(batches)} batches, {len(rows) / max(len(batches), 1):.0f} clips "
+        f"per batch on average"
+    )
 
     dl_kw = dict(num_workers=args.num_workers, pin_memory=dev.type == "cuda")
     if args.num_workers > 0:

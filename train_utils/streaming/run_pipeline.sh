@@ -14,7 +14,7 @@
 #   MODEL      [v3_e2e_ctc]        base model to convert (v3_ctc, v3_e2e_ctc, v3_rnnt, v3_e2e_rnnt)
 #   TRAIN_HOURS [all]              cap on training audio
 #   CONFIGS    ["rc1_c8 rc0_c16"]  streaming configs to train (see below)
-#   EPOCHS     [2]  BATCH [32]  LR [1e-4]  KD_ALPHA [0.5]  WORKERS [16]  PSEUDO_BATCH [128]
+#   EPOCHS     [2]  BATCH [32]  LR [1e-4]  KD_ALPHA [0.5]  WORKERS [16]  PSEUDO_SECONDS [2000]
 #   COMPILE [1]                    0 disables torch.compile (eager; slower steps, no warm-up)
 #   COMPILE_BACKEND [inductor]     torch.compile backend
 #   ACCELERATOR [auto]             Lightning accelerator (cpu for a local smoke run)
@@ -36,7 +36,7 @@ BATCH="${BATCH:-32}"
 LR="${LR:-1e-4}"
 KD_ALPHA="${KD_ALPHA:-0.5}"
 WORKERS="${WORKERS:-16}"
-PSEUDO_BATCH="${PSEUDO_BATCH:-128}"
+PSEUDO_SECONDS="${PSEUDO_SECONDS:-2000}"
 COMPILE="${COMPILE:-1}"
 COMPILE_BACKEND="${COMPILE_BACKEND:-inductor}"
 LEFT_CONTEXT="${LEFT_CONTEXT:-16}"
@@ -86,7 +86,7 @@ if has_stage pseudo; then
   echo "== pseudo-label with offline $MODEL"
   (cd train_utils && $PY pseudo_label.py --teacher "$MODEL" \
       --in_manifest "$DATA_DIR/manifest_train.tsv" --out_manifest "$TRAIN_MANIFEST" \
-      --batch_size "$PSEUDO_BATCH" --num_workers "$WORKERS")
+      --batch_seconds "$PSEUDO_SECONDS" --num_workers "$WORKERS")
 fi
 
 # ------------------------------------------------------------- 3. training
