@@ -13,6 +13,7 @@
 #   TRAIN_HOURS [all]              cap on training audio
 #   CONFIGS    ["rc1_c8 rc0_c16"]  streaming configs to train (see below)
 #   EPOCHS     [2]  BATCH [32]  LR [1e-4]  KD_ALPHA [0.5]  WORKERS [16]
+#   COMPILE [1]                    0 disables torch.compile (eager; slower steps, no warm-up)
 #   COMPILE_BACKEND [inductor]     torch.compile backend
 #   ACCELERATOR [auto]             Lightning accelerator (cpu for a local smoke run)
 #
@@ -33,6 +34,7 @@ BATCH="${BATCH:-32}"
 LR="${LR:-1e-4}"
 KD_ALPHA="${KD_ALPHA:-0.5}"
 WORKERS="${WORKERS:-16}"
+COMPILE="${COMPILE:-1}"
 COMPILE_BACKEND="${COMPILE_BACKEND:-inductor}"
 LEFT_CONTEXT="${LEFT_CONTEXT:-16}"
 ACCELERATOR="${ACCELERATOR:-auto}"
@@ -60,6 +62,11 @@ case "$MODEL" in
 esac
 
 has_stage() { [[ " $STAGES " == *" $1 "* ]]; }
+
+COMPILE_ARGS=""
+if [[ "$COMPILE" == "1" ]]; then
+  COMPILE_ARGS="--compile --compile_backend $COMPILE_BACKEND"
+fi
 
 # ---------------------------------------------------------------- 1. data
 if has_stage data; then
@@ -102,7 +109,7 @@ if has_stage train; then
         --kd_alpha "$KD_ALPHA" \
         --batch_size "$BATCH" --eval_batch_size 64 --bucket_by_duration \
         --num_workers "$WORKERS" --precision bf16-mixed --accelerator "$ACCELERATOR" \
-        --compile --compile_backend "$COMPILE_BACKEND" \
+        $COMPILE_ARGS \
         --lr "$LR" --warmup_ratio 0.05 --gradient_clip_val 1.0 \
         --skip_initial_validation --save_top_k 2 \
         $TEXT_ARGS $TRAIN_ARGS)
