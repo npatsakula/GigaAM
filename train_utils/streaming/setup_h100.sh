@@ -19,7 +19,12 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
+# .python-version pins CPython 3.12: uv downloads a managed interpreter if
+# the box has none, so no system python / -dev headers are involved and every
+# dependency installs from prebuilt wheels (the system 3.14 on some images has
+# no wheels for editdistance and friends).
 # --frozen: install exactly uv.lock, never re-resolve on the server.
+uv python install 3.12
 uv sync --frozen --extra torch --extra train --extra fp8 --extra tests
 
 uv run --frozen python - <<'EOF'

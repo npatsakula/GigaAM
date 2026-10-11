@@ -130,7 +130,7 @@ SMOKE=1 bash train_utils/streaming/run_pipeline.sh   # ~10 min end-to-end check 
 bash train_utils/streaming/run_pipeline.sh           # full run; see the header for the knobs
 ```
 
-The repository is a [uv](https://docs.astral.sh/uv/) project: `pyproject.toml` pins PyTorch 2.14.1 and routes `torch`/`torchaudio`/`torchcodec` to the CUDA 13.0 wheel index on Linux (PyPI builds elsewhere), and `uv.lock` freezes every transitive version. `uv sync --extra torch --extra train` builds `.venv` from that configuration on any machine; every pipeline stage runs through `uv run`.
+The repository is a [uv](https://docs.astral.sh/uv/) project: `pyproject.toml` pins PyTorch 2.14.1 and routes `torch`/`torchaudio`/`torchcodec` to the CUDA 13.0 wheel index on Linux (PyPI builds elsewhere), and `uv.lock` freezes every transitive version. `uv sync --extra torch --extra train` builds `.venv` from that configuration on any machine; every pipeline stage runs through `uv run`. `.python-version` pins CPython 3.12 (uv downloads a managed interpreter when needed), so nothing is built from source.
 
 The pipeline has four stages, selectable with `STAGES="data pseudo train eval"`:
 
