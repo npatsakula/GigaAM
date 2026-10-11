@@ -61,7 +61,16 @@ class StreamingSession:
         model,
         word_timestamps: bool = False,
         batch: Optional["StreamingBatch"] = None,
+        head_padding_seconds: float = 0.0,
+        tail_padding_seconds: float = 0.0,
     ):
+        """``head_padding_seconds`` of silence is fed before the first audio and
+        ``tail_padding_seconds`` after the last (at :meth:`finish`). A chunked
+        model emits a token only once it has seen the following chunk, so the
+        last tokens of a stream can go missing without tail padding, and the
+        first ones lack any left context without head padding. Word timestamps
+        are corrected for the head padding. Both default to 0 (exact parity
+        with the model's full forward on the raw audio)."""
         from .decoding import CTCGreedyDecoding, RNNTGreedyDecoding
 
         encoder = model.encoder
@@ -87,6 +96,8 @@ class StreamingSession:
         self.decoding = model.decoding
         self.word_timestamps = word_timestamps
         self._batch = batch
+        self.head_padding: int = max(0, int(round(head_padding_seconds * SAMPLE_RATE)))
+        self.tail_padding: int = max(0, int(round(tail_padding_seconds * SAMPLE_RATE)))
 
         self.hop_length: int = fe.hop_length
         self.win_length: int = fe.win_length
@@ -119,6 +130,8 @@ class StreamingSession:
         self._enc_frames: int = 0  # encoder frames decoded so far
         self._finished = False
         self.samples_pushed: int = 0
+        if self.head_padding:
+            self._pcm = torch.zeros(self.head_padding, dtype=torch.float32)
         if self._batch is not None:
             self._batch._attach(self)
 
@@ -150,9 +163,16 @@ class StreamingSession:
             return None
         from .timestamps_utils import frames_to_words
 
-        return frames_to_words(
+        words = frames_to_words(
             self.decoding.tokenizer, self._ids, self._frames, self.frame_shift
         )
+        if self.head_padding:
+            off = self.head_padding / SAMPLE_RATE
+            words = [
+                Word(w.text, max(0.0, w.start - off), max(0.0, w.end - off))
+                for w in words
+            ]
+        return words
 
     def result(self) -> TranscriptionResult:
         return TranscriptionResult(text=self.text, words=self.words)
@@ -208,6 +228,9 @@ class StreamingSession:
         chunk), flush any deferred look-ahead chunk and return the final result.
         A batched session leaves its batch here."""
         if not self._finished:
+            if self.tail_padding:
+                pad = torch.zeros(self.tail_padding, dtype=torch.float32)
+                self._pcm = torch.cat([self._pcm, pad]) if self._pcm.numel() else pad
             self._featurize()
             self._drain(final=True)
             with self._encoder_ctx:
@@ -313,10 +336,19 @@ class StreamingBatch:
     ``max_batch_size`` caps the number of streams per encoder call.
     """
 
-    def __init__(self, model, word_timestamps: bool = False, max_batch_size: int = 64):
+    def __init__(
+        self,
+        model,
+        word_timestamps: bool = False,
+        max_batch_size: int = 64,
+        head_padding_seconds: float = 0.0,
+        tail_padding_seconds: float = 0.0,
+    ):
         self.model = model
         self.word_timestamps = word_timestamps
         self.max_batch_size = max(1, int(max_batch_size))
+        self.head_padding_seconds = head_padding_seconds
+        self.tail_padding_seconds = tail_padding_seconds
         self._sessions: List[StreamingSession] = []
 
     @property
@@ -326,7 +358,13 @@ class StreamingBatch:
 
     def new_session(self, word_timestamps: Optional[bool] = None) -> StreamingSession:
         wt = self.word_timestamps if word_timestamps is None else word_timestamps
-        return StreamingSession(self.model, word_timestamps=wt, batch=self)
+        return StreamingSession(
+            self.model,
+            word_timestamps=wt,
+            batch=self,
+            head_padding_seconds=self.head_padding_seconds,
+            tail_padding_seconds=self.tail_padding_seconds,
+        )
 
     def _attach(self, session: StreamingSession) -> None:
         if session not in self._sessions:

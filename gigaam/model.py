@@ -217,6 +217,8 @@ class GigaAMASR(GigaAM):
         wav_file: str,
         word_timestamps: bool = False,
         push_seconds: float = 0.1,
+        head_padding_seconds: float = 0.0,
+        tail_padding_seconds: float = 0.0,
     ) -> TranscriptionResult:
         """
         Transcribe a file through the live streaming path: the audio is pushed
@@ -229,7 +231,12 @@ class GigaAMASR(GigaAM):
         """
         from .streaming import StreamingSession
 
-        session = StreamingSession(self, word_timestamps=word_timestamps)
+        session = StreamingSession(
+            self,
+            word_timestamps=word_timestamps,
+            head_padding_seconds=head_padding_seconds,
+            tail_padding_seconds=tail_padding_seconds,
+        )
         wav = load_audio(wav_file)
         step = max(1, int(push_seconds * SAMPLE_RATE))
         for s in range(0, wav.numel(), step):
@@ -243,6 +250,8 @@ class GigaAMASR(GigaAM):
         word_timestamps: bool = False,
         push_seconds: float = 0.1,
         max_batch_size: int = 64,
+        head_padding_seconds: float = 0.0,
+        tail_padding_seconds: float = 0.0,
     ) -> List[TranscriptionResult]:
         """
         Transcribe several files through the live streaming path at once: every
@@ -255,7 +264,11 @@ class GigaAMASR(GigaAM):
         from .streaming import StreamingBatch
 
         batch = StreamingBatch(
-            self, word_timestamps=word_timestamps, max_batch_size=max_batch_size
+            self,
+            word_timestamps=word_timestamps,
+            max_batch_size=max_batch_size,
+            head_padding_seconds=head_padding_seconds,
+            tail_padding_seconds=tail_padding_seconds,
         )
         wavs = [load_audio(f) for f in wav_files]
         sessions = [batch.new_session() for _ in wavs]

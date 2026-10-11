@@ -83,6 +83,18 @@ def parse_args() -> argparse.Namespace:
         help="Only for zero-shot patching",
     )
     p.add_argument(
+        "--head_padding",
+        type=float,
+        default=0.0,
+        help="Seconds of silence fed before each stream (left context for the first tokens).",
+    )
+    p.add_argument(
+        "--tail_padding",
+        type=float,
+        default=0.0,
+        help="Seconds of silence fed after each stream (look-ahead for the last tokens).",
+    )
+    p.add_argument(
         "--from_hf",
         action="store_true",
         help="Load the offline reference (and zero-shot base) from the HF mirror.",
@@ -153,7 +165,14 @@ def main() -> None:
                 t for t, _, _ in offline.decoding.decode(offline.head, enc, enc_len)
             )
         t0 = time.perf_counter()
-        hyps.extend(r.text for r in stream_model.transcribe_streaming_batch(chunk))
+        hyps.extend(
+            r.text
+            for r in stream_model.transcribe_streaming_batch(
+                chunk,
+                head_padding_seconds=args.head_padding,
+                tail_padding_seconds=args.tail_padding,
+            )
+        )
         infer_s += time.perf_counter() - t0
         print(f"  {min(s + args.batch_size, len(paths))}/{len(paths)}", flush=True)
 

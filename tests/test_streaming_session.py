@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import gigaam
-from gigaam.streaming import StreamingSession
+from gigaam.streaming import StreamingBatch, StreamingSession
 
 VOCAB = list("абвгдежзийклмнопрстуфхцчшщъыьэюя ")  # 33 symbols, blank = 33
 SR = 16000
@@ -308,6 +308,39 @@ def test_batch_session_lifecycle():
     b.finish()
     a.finish()
     assert batch.sessions == []
+
+
+@pytest.mark.parametrize("mode", ["ctc", "rnnt"])
+def test_head_tail_padding(mode):
+    """A session with head/tail padding equals a plain session fed the same
+    audio with the silence spliced in by hand, and its word timestamps are
+    shifted back by the head padding (never negative)."""
+    model = _tiny_model(mode, right_context_chunks=1)
+    wav = _audio(1.37)
+    head, tail = 0.25, 0.4
+    padded = torch.cat([torch.zeros(int(head * SR)), wav, torch.zeros(int(tail * SR))])
+    ref, _ = _run_session(model, padded, 3000, word_timestamps=True)
+    sess = StreamingSession(
+        model,
+        word_timestamps=True,
+        head_padding_seconds=head,
+        tail_padding_seconds=tail,
+    )
+    for s in range(0, wav.numel(), 3000):
+        sess.push(wav[s : s + 3000])
+    res = sess.finish()
+    assert sess._ids == ref._ids and sess._frames == ref._frames
+    assert res.text == ref.text
+    for w, r in zip(res.words, ref.result().words):
+        assert w.text == r.text
+        assert abs(w.start - max(0.0, r.start - head)) < 1e-9
+        assert abs(w.end - max(0.0, r.end - head)) < 1e-9
+    # through the batch helper and the file helper, same result
+    batch = StreamingBatch(model, head_padding_seconds=head, tail_padding_seconds=tail)
+    b = batch.new_session()
+    b.push(wav)
+    batch.step()
+    assert b.finish().text == res.text
 
 
 @pytest.mark.parametrize("name", ["v3_ctc", "v3_rnnt", "v3_e2e_ctc", "v3_e2e_rnnt"])
