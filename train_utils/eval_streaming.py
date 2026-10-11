@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         help="Seconds of silence fed after each stream (look-ahead for the last tokens).",
     )
     p.add_argument(
+        "--padding_noise",
+        type=float,
+        default=0.0,
+        help="Fill head/tail padding with noise of this amplitude (e.g. 1e-3) instead of zeros.",
+    )
+    p.add_argument(
         "--from_hf",
         action="store_true",
         help="Load the offline reference (and zero-shot base) from the HF mirror.",
@@ -172,6 +178,7 @@ def main() -> None:
                 chunk,
                 head_padding_seconds=args.head_padding,
                 tail_padding_seconds=args.tail_padding,
+                padding_noise=args.padding_noise,
             )
         )
         infer_s += time.perf_counter() - t0

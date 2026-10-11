@@ -18,6 +18,7 @@
 #   BATCH_SECONDS [640]            padded audio per training step (clips x longest clip);
 #                                  640 s ~= 58 GB on an H100 for rc1_c8, rc0 configs can take ~1000
 #   BATCH [256]                    cap on clips per step
+#   LEADING_TRIM [0.5]             probability of trimming a clip's leading silence (train aug)
 #   COMPILE [1]                    0 disables torch.compile (eager; slower steps, no warm-up)
 #   COMPILE_BACKEND [inductor]     torch.compile backend
 #   ACCELERATOR [auto]             Lightning accelerator (cpu for a local smoke run)
@@ -37,6 +38,7 @@ STAGES="${STAGES:-data pseudo train eval}"
 EPOCHS="${EPOCHS:-2}"
 BATCH="${BATCH:-256}"
 BATCH_SECONDS="${BATCH_SECONDS:-640}"
+LEADING_TRIM="${LEADING_TRIM:-0.5}"
 LR="${LR:-1e-4}"
 KD_ALPHA="${KD_ALPHA:-0.5}"
 WORKERS="${WORKERS:-16}"
@@ -120,7 +122,7 @@ for MODEL in $MODELS; do
           --val_manifest "$DATA_DIR/manifest_val.tsv" \
           --output_dir "$OUT_DIR" --exp_name "$EXP" \
           --streaming $(config_args "$cfg") --left_context_chunks "$LEFT_CONTEXT" \
-          --kd_alpha "$KD_ALPHA" \
+          --kd_alpha "$KD_ALPHA" --leading_trim_prob "$LEADING_TRIM" \
           --batch_size "$BATCH" --batch_seconds "$BATCH_SECONDS" --eval_batch_size 64 \
           --num_workers "$WORKERS" --precision bf16-mixed --accelerator "$ACCELERATOR" \
           $COMPILE_ARGS \

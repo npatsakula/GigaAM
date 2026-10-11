@@ -154,6 +154,7 @@ def run_models(args) -> List[Dict]:
             chunk,
             head_padding_seconds=args.head_padding,
             tail_padding_seconds=args.tail_padding,
+            padding_noise=args.padding_noise,
         )
         for row, (text, words), hyp, wav in zip(
             rows[s : s + args.batch_size], dec, hyps, wavs
@@ -311,6 +312,12 @@ def main() -> None:
     p.add_argument("--device", default=None)
     p.add_argument("--head_padding", type=float, default=0.0)
     p.add_argument("--tail_padding", type=float, default=0.0)
+    p.add_argument(
+        "--padding_noise",
+        type=float,
+        default=0.0,
+        help="noise amplitude for the padding (0 = zeros)",
+    )
     p.add_argument(
         "--dump", help="write per-clip outputs here (TSV) for offline re-analysis"
     )

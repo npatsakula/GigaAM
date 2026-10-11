@@ -86,6 +86,14 @@ def parse_args() -> argparse.Namespace:
         "carry little silence; typically 1.5-2x throughput on Golos-like data.",
     )
     p.add_argument(
+        "--leading_trim_prob",
+        type=float,
+        default=0.0,
+        help="Augmentation: probability of cutting a random amount of a clip's "
+        "leading silence (never into speech), so the streaming student learns "
+        "utterances that begin right at the stream start.",
+    )
+    p.add_argument(
         "--batch_seconds",
         type=float,
         default=None,
@@ -239,7 +247,9 @@ def main():
         raw_text=args.raw_text,
         return_tokens=True,
     )
-    train_ds = AudioDataset(args.train_manifest, **ds_kw)
+    train_ds = AudioDataset(
+        args.train_manifest, leading_trim_prob=args.leading_trim_prob, **ds_kw
+    )
     val_ds = AudioDataset(args.val_manifest, **ds_kw)
     print(f"Train: {len(train_ds)}  Val: {len(val_ds)}")
 

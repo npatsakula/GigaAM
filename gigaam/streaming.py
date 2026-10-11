@@ -63,6 +63,7 @@ class StreamingSession:
         batch: Optional["StreamingBatch"] = None,
         head_padding_seconds: float = 0.0,
         tail_padding_seconds: float = 0.0,
+        padding_noise: float = 0.0,
     ):
         """``head_padding_seconds`` of silence is fed before the first audio and
         ``tail_padding_seconds`` after the last (at :meth:`finish`). A chunked
@@ -70,7 +71,11 @@ class StreamingSession:
         last tokens of a stream can go missing without tail padding, and the
         first ones lack any left context without head padding. Word timestamps
         are corrected for the head padding. Both default to 0 (exact parity
-        with the model's full forward on the raw audio)."""
+        with the model's full forward on the raw audio). ``padding_noise`` > 0
+        fills the padding with Gaussian noise of that amplitude instead of
+        digital zeros: exact zeros produce log-mel values no recording ever
+        has, while a low noise floor (1e-3 ~ -60 dBFS) looks like the leading
+        silence the model was trained on."""
         from .decoding import CTCGreedyDecoding, RNNTGreedyDecoding
 
         encoder = model.encoder
@@ -98,6 +103,7 @@ class StreamingSession:
         self._batch = batch
         self.head_padding: int = max(0, int(round(head_padding_seconds * SAMPLE_RATE)))
         self.tail_padding: int = max(0, int(round(tail_padding_seconds * SAMPLE_RATE)))
+        self.padding_noise = float(padding_noise)
 
         self.hop_length: int = fe.hop_length
         self.win_length: int = fe.win_length
@@ -131,7 +137,7 @@ class StreamingSession:
         self._finished = False
         self.samples_pushed: int = 0
         if self.head_padding:
-            self._pcm = torch.zeros(self.head_padding, dtype=torch.float32)
+            self._pcm = self._padding(self.head_padding)
         if self._batch is not None:
             self._batch._attach(self)
 
@@ -178,6 +184,12 @@ class StreamingSession:
         return TranscriptionResult(text=self.text, words=self.words)
 
     # ------------------------------------------------------------------ input
+    def _padding(self, n: int) -> Tensor:
+        if self.padding_noise > 0:
+            g = torch.Generator().manual_seed(0)  # deterministic per session
+            return torch.randn(n, generator=g) * self.padding_noise
+        return torch.zeros(n, dtype=torch.float32)
+
     @staticmethod
     def _to_pcm(audio: AudioLike) -> Tensor:
         if isinstance(audio, np.ndarray):
@@ -229,7 +241,7 @@ class StreamingSession:
         A batched session leaves its batch here."""
         if not self._finished:
             if self.tail_padding:
-                pad = torch.zeros(self.tail_padding, dtype=torch.float32)
+                pad = self._padding(self.tail_padding)
                 self._pcm = torch.cat([self._pcm, pad]) if self._pcm.numel() else pad
             self._featurize()
             self._drain(final=True)
@@ -343,12 +355,14 @@ class StreamingBatch:
         max_batch_size: int = 64,
         head_padding_seconds: float = 0.0,
         tail_padding_seconds: float = 0.0,
+        padding_noise: float = 0.0,
     ):
         self.model = model
         self.word_timestamps = word_timestamps
         self.max_batch_size = max(1, int(max_batch_size))
         self.head_padding_seconds = head_padding_seconds
         self.tail_padding_seconds = tail_padding_seconds
+        self.padding_noise = padding_noise
         self._sessions: List[StreamingSession] = []
 
     @property
@@ -364,6 +378,7 @@ class StreamingBatch:
             batch=self,
             head_padding_seconds=self.head_padding_seconds,
             tail_padding_seconds=self.tail_padding_seconds,
+            padding_noise=self.padding_noise,
         )
 
     def _attach(self, session: StreamingSession) -> None:

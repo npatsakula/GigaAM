@@ -202,9 +202,18 @@ class AudioDataset(torch.utils.data.Dataset):
         min_duration: float = 0.0,
         raw_text: bool = False,
         return_tokens: bool = False,
+        leading_trim_prob: float = 0.0,
     ):
+        """``leading_trim_prob``: training augmentation. With this probability a
+        clip has a random amount of its *leading silence* cut off (never into
+        speech: an energy-based onset estimate minus a 100 ms margin bounds
+        the cut), so a streaming student also learns speech that starts at the
+        very beginning of a stream. Golos clips otherwise almost always begin
+        with silence, and a model fine-tuned on them drops the first
+        characters of utterances that start immediately."""
         self.raw_text = raw_text
         self.return_tokens = return_tokens
+        self.leading_trim_prob = float(leading_trim_prob)
         self.tokenizer = tokenizer
         self.samples: List[AudioDatasetSample] = []
 
@@ -370,9 +379,37 @@ class AudioDataset(torch.utils.data.Dataset):
             return item
         raise TypeError(f"Unexpected sample type: {type(item)}")
 
+    @staticmethod
+    def trim_leading_silence(wav: Tensor, margin_s: float = 0.1) -> Tensor:
+        """Cut a uniformly random amount of the leading silence (up to the
+        estimated speech onset minus ``margin_s``). Onset: the first 20 ms frame
+        whose RMS exceeds max(3 x noise floor, 10% of the peak RMS)."""
+        import random
+
+        hop, win = SAMPLE_RATE // 100, SAMPLE_RATE // 50
+        if wav.numel() < 2 * win:
+            return wav
+        frames = wav.unfold(0, win, hop)
+        rms = frames.float().pow(2).mean(-1).sqrt()
+        floor = torch.quantile(rms, 0.1)
+        thr = torch.maximum(3 * floor, 0.1 * rms.max())
+        above = (rms > thr).nonzero()
+        if above.numel() == 0:
+            return wav
+        onset = int(above[0].item()) * hop
+        max_cut = onset - int(margin_s * SAMPLE_RATE)
+        if max_cut <= 0:
+            return wav
+        return wav[random.randint(0, max_cut) :]
+
     def __getitem__(self, idx: int) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         sample = self.samples[idx]
         wav = self._load_audio(sample.item)
+        if self.leading_trim_prob > 0:
+            import random
+
+            if random.random() < self.leading_trim_prob:
+                wav = self.trim_leading_silence(wav)
 
         if self.return_tokens:
             assert sample.tokens is not None

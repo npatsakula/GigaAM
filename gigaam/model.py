@@ -219,6 +219,7 @@ class GigaAMASR(GigaAM):
         push_seconds: float = 0.1,
         head_padding_seconds: float = 0.0,
         tail_padding_seconds: float = 0.0,
+        padding_noise: float = 0.0,
     ) -> TranscriptionResult:
         """
         Transcribe a file through the live streaming path: the audio is pushed
@@ -236,6 +237,7 @@ class GigaAMASR(GigaAM):
             word_timestamps=word_timestamps,
             head_padding_seconds=head_padding_seconds,
             tail_padding_seconds=tail_padding_seconds,
+            padding_noise=padding_noise,
         )
         wav = load_audio(wav_file)
         step = max(1, int(push_seconds * SAMPLE_RATE))
@@ -252,6 +254,7 @@ class GigaAMASR(GigaAM):
         max_batch_size: int = 64,
         head_padding_seconds: float = 0.0,
         tail_padding_seconds: float = 0.0,
+        padding_noise: float = 0.0,
     ) -> List[TranscriptionResult]:
         """
         Transcribe several files through the live streaming path at once: every
@@ -269,6 +272,7 @@ class GigaAMASR(GigaAM):
             max_batch_size=max_batch_size,
             head_padding_seconds=head_padding_seconds,
             tail_padding_seconds=tail_padding_seconds,
+            padding_noise=padding_noise,
         )
         wavs = [load_audio(f) for f in wav_files]
         sessions = [batch.new_session() for _ in wavs]
