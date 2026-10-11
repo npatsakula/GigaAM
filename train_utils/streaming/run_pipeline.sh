@@ -14,7 +14,10 @@
 #   MODEL      [v3_e2e_ctc]        base model to convert (v3_ctc, v3_e2e_ctc, v3_rnnt, v3_e2e_rnnt)
 #   TRAIN_HOURS [all]              cap on training audio
 #   CONFIGS    ["rc1_c8 rc0_c16"]  streaming configs to train (see below)
-#   EPOCHS     [2]  BATCH [32]  LR [1e-4]  KD_ALPHA [0.5]  WORKERS [16]  PSEUDO_SECONDS [2000]
+#   EPOCHS     [2]  LR [1e-4]  KD_ALPHA [0.5]  WORKERS [16]  PSEUDO_SECONDS [2000]
+#   BATCH_SECONDS [640]            padded audio per training step (clips x longest clip);
+#                                  640 s ~= 58 GB on an H100 for rc1_c8, rc0 configs can take ~1000
+#   BATCH [256]                    cap on clips per step
 #   COMPILE [1]                    0 disables torch.compile (eager; slower steps, no warm-up)
 #   COMPILE_BACKEND [inductor]     torch.compile backend
 #   ACCELERATOR [auto]             Lightning accelerator (cpu for a local smoke run)
@@ -32,7 +35,8 @@ MODEL="${MODEL:-v3_e2e_ctc}"
 CONFIGS="${CONFIGS:-rc1_c8 rc0_c16}"
 STAGES="${STAGES:-data pseudo train eval}"
 EPOCHS="${EPOCHS:-2}"
-BATCH="${BATCH:-32}"
+BATCH="${BATCH:-256}"
+BATCH_SECONDS="${BATCH_SECONDS:-640}"
 LR="${LR:-1e-4}"
 KD_ALPHA="${KD_ALPHA:-0.5}"
 WORKERS="${WORKERS:-16}"
@@ -52,6 +56,7 @@ if [[ "${SMOKE:-0}" == "1" ]]; then
   TRAIN_ARGS="--max_steps 4 --val_check_steps 4 --val_first_batches 2 --log_every_n_steps 1"
   EVAL_LIMIT="--limit 8"
   BATCH=4
+  BATCH_SECONDS=60
 else
   TRAIN_HOURS="${TRAIN_HOURS:-}"
   VAL_HOURS="${VAL_HOURS:-2}"
@@ -110,7 +115,7 @@ if has_stage train; then
         --output_dir "$OUT_DIR" --exp_name "$EXP" \
         --streaming $(config_args "$cfg") --left_context_chunks "$LEFT_CONTEXT" \
         --kd_alpha "$KD_ALPHA" \
-        --batch_size "$BATCH" --eval_batch_size 64 --bucket_by_duration \
+        --batch_size "$BATCH" --batch_seconds "$BATCH_SECONDS" --eval_batch_size 64 \
         --num_workers "$WORKERS" --precision bf16-mixed --accelerator "$ACCELERATOR" \
         $COMPILE_ARGS \
         --lr "$LR" --warmup_ratio 0.05 --gradient_clip_val 1.0 \

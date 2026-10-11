@@ -86,6 +86,16 @@ def parse_args() -> argparse.Namespace:
         "carry little silence; typically 1.5-2x throughput on Golos-like data.",
     )
     p.add_argument(
+        "--batch_seconds",
+        type=float,
+        default=None,
+        help="Close each batch on a padded-audio budget (clips x longest clip, in "
+        "seconds) instead of a fixed clip count, so every step carries the same "
+        "work; --batch_size then caps clips per batch. Implies "
+        "--bucket_by_duration. Memory scales with this budget, not with the "
+        "clip count.",
+    )
+    p.add_argument(
         "--streaming",
         action="store_true",
         help="Fine-tune a streaming encoder: chunked block attention + causal "
@@ -238,12 +248,15 @@ def main():
         # Keep workers alive across epochs/validation and read ahead so the
         # GPU never waits on wav decoding.
         dl_kw.update(persistent_workers=True, prefetch_factor=4)
+    if args.batch_seconds:
+        args.bucket_by_duration = True
     if args.bucket_by_duration:
         train_sampler = DurationBucketBatchSampler(
             [s.duration for s in train_ds.samples],
             batch_size=args.batch_size,
             seed=args.seed,
             drop_last=True,
+            max_seconds=args.batch_seconds,
         )
         train_dl = DataLoader(
             train_ds,
@@ -251,7 +264,14 @@ def main():
             collate_fn=train_ds.collate_fn,
             **dl_kw,
         )
-        print(f"Duration bucketing: {len(train_sampler)} batches/epoch")
+        print(
+            f"Duration bucketing: {len(train_sampler)} batches/epoch"
+            + (
+                f" ({args.batch_seconds:.0f} s padded audio per batch)"
+                if args.batch_seconds
+                else ""
+            )
+        )
     else:
         train_dl = DataLoader(
             train_ds,

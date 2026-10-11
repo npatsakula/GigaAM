@@ -252,12 +252,19 @@ class DurationBucketBatchSampler:
         bucket_mult: int = 50,
         seed: int = 0,
         drop_last: bool = True,
+        max_seconds: Optional[float] = None,
     ):
+        """``max_seconds`` closes a batch when its padded audio
+        (``len(batch) * longest clip``) would exceed the budget, so every step
+        carries about the same work and short clips are batched by the hundreds;
+        ``batch_size`` is then the cap on clips per batch. ``None`` keeps
+        fixed-size batches."""
         self.durations = list(durations)
         self.batch_size = batch_size
         self.bucket_mult = max(1, bucket_mult)
         self.seed = seed
         self.drop_last = drop_last
+        self.max_seconds = max_seconds
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -275,15 +282,43 @@ class DurationBucketBatchSampler:
 
         rng = random.Random(self.seed + self.epoch)
         order = sorted(range(len(self.durations)), key=lambda i: self.durations[i])
-        bucket = self.batch_size * self.bucket_mult
         batches: List[List[int]] = []
-        for s in range(0, len(order), bucket):
-            idx = order[s : s + bucket]
+        if self.max_seconds is None:
+            bucket = self.batch_size * self.bucket_mult
+            buckets = [order[s : s + bucket] for s in range(0, len(order), bucket)]
+        else:
+            # Buckets of ~bucket_mult batches' worth of audio, so a bucket spans a
+            # narrow duration range whatever the clip cap is.
+            budget = self.bucket_mult * self.max_seconds
+            buckets, cur, acc = [], [], 0.0
+            for i in order:
+                cur.append(i)
+                acc += self.durations[i]
+                if acc >= budget:
+                    buckets.append(cur)
+                    cur, acc = [], 0.0
+            if cur:
+                buckets.append(cur)
+        for idx in buckets:
             rng.shuffle(idx)
-            for b in range(0, len(idx), self.batch_size):
-                batch = idx[b : b + self.batch_size]
-                if len(batch) == self.batch_size or not self.drop_last:
-                    batches.append(batch)
+            if self.max_seconds is None:
+                for b in range(0, len(idx), self.batch_size):
+                    batch = idx[b : b + self.batch_size]
+                    if len(batch) == self.batch_size or not self.drop_last:
+                        batches.append(batch)
+                continue
+            cur: List[int] = []
+            cur_max = 0.0
+            for i in idx:
+                d = self.durations[i]
+                padded = (len(cur) + 1) * max(cur_max, d)
+                if cur and (padded > self.max_seconds or len(cur) >= self.batch_size):
+                    batches.append(cur)
+                    cur, cur_max = [], 0.0
+                cur.append(i)
+                cur_max = max(cur_max, d)
+            if cur and (not self.drop_last or len(cur) > 1):
+                batches.append(cur)
         rng.shuffle(batches)
         rank, world = self._rank_world()
         if world > 1:
